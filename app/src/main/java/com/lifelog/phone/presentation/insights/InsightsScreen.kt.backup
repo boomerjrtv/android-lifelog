@@ -1,0 +1,287 @@
+package com.lifelog.phone.presentation.insights
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import com.lifelog.phone.data.remote.LifeLogApi
+import com.lifelog.phone.Insight
+import com.lifelog.phone.InsightsResponse
+import com.lifelog.phone.presentation.auth.GoogleSignInButton
+import com.lifelog.phone.presentation.auth.GoogleSignInService
+import com.lifelog.phone.presentation.auth.GoogleAuthResult
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+@Composable
+private fun InsightSection(
+    title: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    items: List<Insight>
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp)
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+        
+        items.forEach { item ->
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp)
+                ) {
+                    item.title?.let { title ->
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.padding(bottom = 4.dp)
+                        )
+                    }
+                    
+                    item.text?.let { text ->
+                        Text(
+                            text = text,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    
+                    item.time?.let { time ->
+                        Text(
+                            text = time,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    
+                    item.location?.let { location ->
+                        Text(
+                            text = "📍 $location",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun InsightsContent(
+    insights: Map<String, List<Insight>>,
+    isLoading: Boolean,
+    error: String?,
+    onNavigateBack: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+    ) {
+        // Header
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Insights",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold
+            )
+        }
+        
+        when {
+            isLoading -> {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator()
+                }
+            }
+            error != null -> {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = error!!,
+                        color = Color.Red,
+                        style = MaterialTheme.typography.bodyLarge
+                    )
+                }
+            }
+            else -> {
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    // Memories Section
+                    insights["memories"]?.let { memories ->
+                        if (memories.isNotEmpty()) {
+                            item {
+                                InsightSection(
+                                    title = "Recent Memories",
+                                    icon = Icons.Default.Lightbulb,
+                                    items = memories
+                                )
+                            }
+                        }
+                    }
+                    
+                    // Upcoming Events Section
+                    insights["upcoming"]?.let { upcoming ->
+                        if (upcoming.isNotEmpty()) {
+                            item {
+                                InsightSection(
+                                    title = "Upcoming Events",
+                                    icon = Icons.Default.Event,
+                                    items = upcoming
+                                )
+                            }
+                        }
+                    }
+                    
+                    // Tasks Section
+                    insights["tasks"]?.let { tasks ->
+                        if (tasks.isNotEmpty()) {
+                            item {
+                                InsightSection(
+                                    title = "Task Mentions",
+                                    icon = Icons.Default.Task,
+                                    items = tasks
+                                )
+                            }
+                        }
+                    }
+                }
+        }
+        
+        // Back button
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End
+        ) {
+            TextButton(onClick = onNavigateBack) {
+                Text("Back")
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun InsightsScreen(
+    api: LifeLogApi,
+    googleSignInService: GoogleSignInService,
+    onNavigateBack: () -> Unit,
+    onError: (String) -> Unit = {}
+) {
+    var insights by remember { mutableStateOf<Map<String, List<Insight>>>(emptyMap()) }
+    var isLoading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var isSigningIn by remember { mutableStateOf(false) }
+    
+    val coroutineScope = rememberCoroutineScope()
+    
+    // Check if user is already signed in with Google
+    val signedInAccount = googleSignInService.getSignedInAccount()
+    
+    LaunchedEffect(Unit) {
+        if (signedInAccount != null) {
+            // User is signed in, load insights
+            coroutineScope.launch {
+                try {
+                    isLoading.value = true
+                    error.value = null
+                    val response = api.getInsights()
+                    withContext(Dispatchers.Main) {
+                        insights.value = response.insights
+                        isLoading.value = false
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        error.value = "Failed to load insights: ${e.localizedMessage}"
+                        isLoading.value = false
+                    }
+                }
+            }
+        } else {
+            // User not signed in, don't load insights
+            isLoading.value = false
+        }
+    }
+    
+    LaunchedEffect(key1 = error.value) {
+        error.value?.let { onError(it) }
+    }
+    
+    if (signedInAccount != null) {
+        // User is signed in, show insights
+        InsightsContent(insights, isLoading, error, onNavigateBack)
+    } else {
+        // User not signed in, show Google Sign-In
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = "Sign in to view Insights",
+                style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.padding(16.dp)
+            )
+            
+            Spacer(modifier = Modifier.height(32.dp))
+            
+            GoogleSignInButton(
+                onSignInClick = { 
+                    isSigningIn.value = true
+                    coroutineScope.launch {
+                        val result = googleSignInService.signIn()
+                        isSigningIn.value = false
+                        if (result.success) {
+                            // Sign-in successful, insights will load automaticallyically
+                        } else {
+                            error.value = result.error ?: "Sign-in failed"
+                        }
+                    }
+                },
+                isLoading = isSigningIn.value
+            )
+            
+            error.value?.let { errorMsg ->
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = errorMsg,
+                    color = Color.Red,
+                    modifier = Modifier.padding(horizontal = 16.dp)
+                )
+            }
+        }
+    }
+}
+}

@@ -1,0 +1,14 @@
+package com.lifelog.phone.data.local
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+@Entity(tableName = "messages")
+data class MessageEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val role: String,
+    val text: String,
+    val timestamp: Long = System.currentTimeMillis(),
+    val stem: String = ""
+)

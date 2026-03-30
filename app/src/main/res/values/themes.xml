@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.LifeLogPhone" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="colorPrimary">#3949AB</item>
+        <item name="colorPrimaryDark">#283593</item>
+        <item name="colorAccent">#F2C94C</item>
+    </style>
+</resources>
