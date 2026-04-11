@@ -1,12 +1,7 @@
 package com.lifelog.phone.presentation.transcript
 
 import android.Manifest
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.os.Bundle
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -59,7 +54,6 @@ import com.lifelog.phone.ui.theme.TextMuted
 import com.lifelog.phone.ui.theme.TextPrimary
 import com.lifelog.phone.ui.theme.TextSecondary
 import androidx.core.content.ContextCompat
-import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -77,8 +71,6 @@ fun LiveTranscriptScreen(
     var speakerInput by remember { mutableStateOf("") }
     var mergeFrom by remember { mutableStateOf("") }
     var mergeTo by remember { mutableStateOf("") }
-    val livePartial by viewModel.livePartial.collectAsState()
-    val recognizerAvailable = remember(context) { SpeechRecognizer.isRecognitionAvailable(context) }
     var hasRecordAudioPermission by remember(context) {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -89,7 +81,7 @@ fun LiveTranscriptScreen(
     ) { granted ->
         hasRecordAudioPermission = granted
         viewModel.setRecognizerStatus(
-            if (granted) "Background mic active" else "Microphone permission is required for live transcript"
+            if (granted) "Background transcript feed active" else "Microphone permission is required for live transcript"
         )
     }
 
@@ -102,82 +94,9 @@ fun LiveTranscriptScreen(
 
     DisposableEffect(hasRecordAudioPermission) {
         viewModel.setRecognizerStatus(
-            if (hasRecordAudioPermission) "Background mic active" else "Microphone permission is required for live transcript"
+            if (hasRecordAudioPermission) "Background transcript feed active" else "Microphone permission is required for live transcript"
         )
         onDispose {}
-    }
-
-    DisposableEffect(context, hasRecordAudioPermission, recognizerAvailable) {
-        if (!hasRecordAudioPermission || !recognizerAvailable) {
-            onDispose {}
-        } else {
-            val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
-            val listenIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.US.toLanguageTag())
-                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1500L)
-            }
-
-            fun restart() {
-                runCatching { recognizer.startListening(listenIntent) }
-                    .onFailure { viewModel.setRecognizerStatus("Live preview unavailable") }
-            }
-
-            recognizer.setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {
-                    viewModel.setRecognizerStatus("Live preview active")
-                }
-                override fun onBeginningOfSpeech() = Unit
-                override fun onRmsChanged(rmsdB: Float) = Unit
-                override fun onBufferReceived(buffer: ByteArray?) = Unit
-                override fun onEndOfSpeech() = Unit
-                override fun onEvent(eventType: Int, params: Bundle?) = Unit
-
-                override fun onPartialResults(partialResults: Bundle?) {
-                    val best = partialResults
-                        ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        ?.firstOrNull()
-                        .orEmpty()
-                    if (best.isNotBlank()) viewModel.setLivePartial(best)
-                }
-
-                override fun onResults(results: Bundle?) {
-                    val best = results
-                        ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        ?.firstOrNull()
-                        .orEmpty()
-                    if (best.isNotBlank()) {
-                        viewModel.setLivePartial(best)
-                        viewModel.commitTranscript(best)
-                    } else {
-                        viewModel.setLivePartial("")
-                    }
-                    restart()
-                }
-
-                override fun onError(error: Int) {
-                    val noSpeech = error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
-                    if (!noSpeech) {
-                        viewModel.setRecognizerStatus("Live preview error: $error")
-                    }
-                    viewModel.setLivePartial("")
-                    restart()
-                }
-            })
-
-            restart()
-
-            onDispose {
-                viewModel.setLivePartial("")
-                recognizer.cancel()
-                recognizer.destroy()
-            }
-        }
     }
 
     LaunchedEffect(hasRecordAudioPermission) {
@@ -227,21 +146,6 @@ fun LiveTranscriptScreen(
             Spacer(Modifier.height(8.dp))
             Button(onClick = { recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO) }) {
                 Text("Grant microphone access")
-            }
-        }
-
-        if (livePartial.isNotBlank()) {
-            Spacer(Modifier.height(8.dp))
-            Card(
-                colors = CardDefaults.cardColors(containerColor = DarkSurfaceVariant),
-                shape = RoundedCornerShape(12.dp),
-                border = BorderStroke(1.dp, DarkBorder),
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Text("Listening now", color = AccentBlue, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                    Spacer(Modifier.height(6.dp))
-                    Text(livePartial, color = TextPrimary, fontSize = 15.sp)
-                }
             }
         }
 
