@@ -67,8 +67,8 @@ fun SpeakerReviewScreen(
     LaunchedEffect(tempId) {
         withContext(Dispatchers.IO) {
             try {
-                val baseUrl = api.settingsRepository.cachedBaseUrl.trim().trimEnd('/')
-                val token = api.settingsRepository.cachedToken
+                val baseUrl = api.settingsRepository.cachedLifeLogSyncUrl.trim().trimEnd('/')
+                val token = api.settingsRepository.cachedLifeLogSyncToken
                 val reqBuilder = Request.Builder().url("$baseUrl/phone/speaker/pending").get()
                 if (token.isNotEmpty()) reqBuilder.addHeader("X-Phone-Token", token)
                 OkHttpClient().newCall(reqBuilder.build()).execute().use { resp ->
@@ -150,8 +150,8 @@ fun SpeakerReviewScreen(
                             scope.launch {
                                 isPlaying = true
                                 try {
-                                    val baseUrl = api.settingsRepository.cachedBaseUrl.trim().trimEnd('/')
-                                    val token = api.settingsRepository.cachedToken
+                                    val baseUrl = api.settingsRepository.cachedLifeLogSyncUrl.trim().trimEnd('/')
+                                    val token = api.settingsRepository.cachedLifeLogSyncToken
                                     val url = "$baseUrl/phone/speaker/sample?temp_id=${q.tempId}"
                                     val mp = MediaPlayer().apply {
                                         setAudioAttributes(
@@ -306,8 +306,8 @@ private suspend fun doIdentify(
     onError: (String) -> Unit,
 ) = withContext(Dispatchers.IO) {
     try {
-        val baseUrl = api.settingsRepository.cachedBaseUrl.trim().trimEnd('/')
-        val token = api.settingsRepository.cachedToken
+        val baseUrl = api.settingsRepository.cachedLifeLogSyncUrl.trim().trimEnd('/')
+        val token = api.settingsRepository.cachedLifeLogSyncToken
         val payload = JSONObject().apply { put("temp_id", tempId); put("name", name) }.toString()
         val req = Request.Builder()
             .url("$baseUrl/phone/speaker/identify")
@@ -325,8 +325,8 @@ private suspend fun doIdentify(
 private suspend fun doSkip(api: LifeLogApi, tempId: String, onDone: () -> Unit) =
     withContext(Dispatchers.IO) {
         try {
-            val baseUrl = api.settingsRepository.cachedBaseUrl.trim().trimEnd('/')
-            val token = api.settingsRepository.cachedToken
+            val baseUrl = api.settingsRepository.cachedLifeLogSyncUrl.trim().trimEnd('/')
+            val token = api.settingsRepository.cachedLifeLogSyncToken
             val payload = JSONObject().apply { put("temp_id", tempId); put("skip", true) }.toString()
             val req = Request.Builder()
                 .url("$baseUrl/phone/speaker/identify")

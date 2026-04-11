@@ -33,8 +33,8 @@ class SetupViewModel @Inject constructor(
     val isConnected: StateFlow<Boolean> = _isConnected.asStateFlow()
 
     init {
-        _baseUrl.value = settingsRepository.baseUrl
-        _token.value = settingsRepository.token
+        _baseUrl.value = settingsRepository.lifeLogSyncUrl
+        _token.value = settingsRepository.lifeLogSyncToken
     }
 
     fun updateBaseUrl(value: String) {
@@ -59,8 +59,8 @@ class SetupViewModel @Inject constructor(
 
             val result = api.health(url)
             if (result.isSuccess && result.getOrNull() == true) {
-                settingsRepository.baseUrl = url
-                settingsRepository.token = _token.value.trim()
+                settingsRepository.lifeLogSyncUrl = url
+                settingsRepository.lifeLogSyncToken = _token.value.trim()
                 _isConnected.value = true
                 _status.value = "Connected!"
                 _isLoading.value = false

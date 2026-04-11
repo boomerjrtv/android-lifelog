@@ -120,6 +120,7 @@ fun DashboardScreen(
     viewModel: DashboardViewModel,
     onEnrollSpeaker: (String) -> Unit = {}
 ) {
+    val isLocalOnly = baseUrl.isBlank()
     val facts by viewModel.facts.collectAsState()
     val logs by viewModel.logs.collectAsState()
     val logTypeOptions by viewModel.logTypeOptions.collectAsState()
@@ -144,7 +145,7 @@ fun DashboardScreen(
     }
 
     // Rearrange tabs: Quest first, then Facts, Logs, Daily, Events, Replay
-    var selectedTab by remember { mutableIntStateOf(0) }
+    var selectedTab by remember(isLocalOnly) { mutableIntStateOf(if (isLocalOnly) 2 else 0) }
     var query by remember { mutableStateOf("") }
     var replayDayFilter by remember { mutableStateOf("today") }
 
@@ -366,6 +367,16 @@ fun DashboardScreen(
             }
         }
 
+        if (isLocalOnly) {
+            Text(
+                text = "App-only mode: Dashboard is using local phone data. Questions and remote audio are unavailable.",
+                color = TextSecondary,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(horizontal = 12.dp)
+            )
+            Spacer(Modifier.height(8.dp))
+        }
+
         if (selectedTab == 2) {
             LazyRow(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(logTypeOptions) { opt -> FilterChip(selected = selectedLogType == opt.key, onClick = { viewModel.setLogTypeFilter(opt.key) }, label = { Text("${opt.label} (${opt.count})") }) }
@@ -382,12 +393,16 @@ fun DashboardScreen(
             Spacer(Modifier.height(8.dp))
         }
 
-        Box(modifier = Modifier.fillMaxSize()) {
+        Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
             if ((selectedTab == 0 && isLoadingQuestions) || (selectedTab == 1 && isLoadingFacts) || (selectedTab == 2 && isLoadingLogs) || (selectedTab == 3 && isLoadingRoutines) || (selectedTab == 4 && isLoadingCalendar)) {
                 CircularProgressIndicator(modifier = Modifier.align(Alignment.Center), color = AccentBlue)
             } else {
                 when(selectedTab) {
-                    0 -> QuestionsList(items = qaItems, onAnswer = { qItem, ans -> viewModel.answerQuestion(baseUrl, qItem, ans); Toast.makeText(context, "Submitted!", Toast.LENGTH_SHORT).show() }, onPlayAudio = { stem, ts -> viewModel.playAudio(stem, ts) })
+                    0 -> if (isLocalOnly) {
+                        EmptyDashboardMessage("Questions need a remote LifeLog server. Local logs, routines, events, and replay still work in the app.")
+                    } else {
+                        QuestionsList(items = qaItems, onAnswer = { qItem, ans -> viewModel.answerQuestion(baseUrl, qItem, ans); Toast.makeText(context, "Submitted!", Toast.LENGTH_SHORT).show() }, onPlayAudio = { stem, ts -> viewModel.playAudio(stem, ts) })
+                    }
                     1 -> FactsList(items = facts, onEdit = { fact -> factEditId = fact.id; factText = fact.text; factCategory = "general"; showFactEditor = true }, onDelete = { fact -> viewModel.deleteFact(fact.id) })
                     2 -> LogsList(items = logs, selectedType = selectedLogType, onEdit = { row -> if (row.kind.lowercase() == "transcript") { transcriptEditId = if (row.transcriptId > 0L) row.transcriptId else kotlin.math.abs(row.id); transcriptText = row.text; transcriptSpeakerId = row.speakerId; transcriptTags = row.tags; showTranscriptEditor = true } else { logEditId = row.id; logKind = row.kind; logText = row.text; showLogEditor = true } }, onDelete = { row -> viewModel.deleteLog(row.id) }, onPlayAudio = { stem, ts -> viewModel.playAudio(stem, ts) })
                     3 -> RoutinesList(items = routines, onEdit = { item -> routineEditId = item.id; routineTitle = item.title; routineNote = item.note; showRoutineEditor = true }, onToggleActive = { item -> viewModel.upsertRoutine(id = item.id, title = item.title, kind = item.kind, anchorKey = item.anchorKey, hourBucket = item.hourBucket, weekdays = item.weekdays, note = item.note, confidence = item.confidence, active = !item.active, source = item.source, occurrences = item.occurrences, firstSeenTs = item.firstSeenTs, lastSeenTs = item.lastSeenTs) }, onDelete = { item -> viewModel.deleteRoutine(item.id) })
@@ -414,6 +429,22 @@ private fun FactsList(items: List<Fact>, onEdit: (Fact) -> Unit, onDelete: (Fact
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun EmptyDashboardMessage(text: String) {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Card(
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(containerColor = DarkSurfaceVariant)
+        ) {
+            Text(
+                text = text,
+                color = TextSecondary,
+                modifier = Modifier.padding(16.dp)
+            )
         }
     }
 }

@@ -34,8 +34,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.lifelog.phone.Prefs
 import com.lifelog.phone.data.Message
+import com.lifelog.phone.data.remote.ChatResult
 import com.lifelog.phone.ui.theme.*
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -318,6 +318,7 @@ fun ChatScreen(
                 val hasEvidence = messageEvidence[message.id] != null
                 MessageBubble(
                     message = message,
+                    details = messageEvidence[message.id],
                     viewModel = viewModel,
                     isAudioPlaying = isAudioPlaying,
                     currentlyPlayingMessageId = currentlyPlayingMessageId,
@@ -450,7 +451,9 @@ fun ChatScreen(
                                             assistantPreview = reply
                                             onConversationAssistantReply(reply)
                                             liveTranscript = ""
-                                            conversationStatus = "Listening..."
+                                            conversationStatus = "Done"
+                                            isConversationMode = false
+                                            onConversationModeStop()
                                         }
                                     }
                                 },
@@ -578,6 +581,7 @@ private fun ConversationMemoryCard(
 @Composable
 fun MessageBubble(
     message: Message,
+    details: ChatResult?,
     viewModel: ChatViewModel,
     isAudioPlaying: Boolean,
     currentlyPlayingMessageId: Long?,
@@ -637,23 +641,17 @@ fun MessageBubble(
         }
 
         Column(horizontalAlignment = if (isUser) Alignment.End else Alignment.Start) {
-            // Model indicator
             if (!isUser) {
-                val context = LocalContext.current
-                val prefs = Prefs(context)
-                val modelLabel = when (prefs.aiProvider()) {
-                    "Gemini" -> "GEMINI"
-                    "Ollama" -> "OLLAMA"
-                    "Zai" -> "ZAI"
-                    else -> "ASSISTANT"
+                val modelLabel = details?.let { formatModelLabel(it.model, it.mode) }.orEmpty()
+                if (modelLabel.isNotBlank()) {
+                    Text(
+                        text = modelLabel,
+                        color = AccentBlue.copy(alpha = 0.7f),
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 2.dp, start = 4.dp)
+                    )
                 }
-                Text(
-                    text = modelLabel,
-                    color = AccentBlue.copy(alpha = 0.7f),
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(bottom = 2.dp, start = 4.dp)
-                )
             }
 
             Box(
@@ -704,13 +702,9 @@ fun MessageBubble(
                     IconButton(
                         onClick = {
                             if (isThisMessagePlaying) {
-                                // Pause
-                                viewModel.pauseAudio()
-                            } else if (currentlyPlayingMessageId == message.id) {
-                                // Resume
-                                viewModel.resumeAudio()
+                                viewModel.stopSpeech()
+                                onCurrentlyPlayingIdChange(null)
                             } else {
-                                // Start new TTS
                                 Toast.makeText(currentContext, "Playing TTS...", Toast.LENGTH_SHORT).show()
                                 onCurrentlyPlayingIdChange(message.id)
                                 onPlayTTS(message.text)
@@ -743,6 +737,19 @@ fun MessageBubble(
                 Icon(Icons.Default.Person, contentDescription = null, tint = TextPrimary.copy(alpha = 0.6f), modifier = Modifier.size(16.dp))
             }
         }
+    }
+}
+
+private fun formatModelLabel(model: String, mode: String): String {
+    val cleanModel = model.trim().lowercase()
+    return when {
+        cleanModel == "gemma4-e4b-on-device" || cleanModel == "gemma4-on-device" -> "GEMMA 4"
+        cleanModel == "gemini-nano" -> "GEMINI NANO"
+        cleanModel.startsWith("gemini-") -> cleanModel.uppercase()
+        cleanModel.startsWith("gpt-") -> cleanModel.uppercase()
+        cleanModel.isNotBlank() -> cleanModel.uppercase()
+        mode.trim().isNotBlank() -> mode.trim().uppercase()
+        else -> ""
     }
 }
 

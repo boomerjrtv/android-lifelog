@@ -1,7 +1,5 @@
 package com.lifelog.phone.service
 
-import ai.picovoice.porcupine.Porcupine
-import ai.picovoice.porcupine.PorcupineException
 import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
@@ -11,618 +9,448 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import android.media.ToneGenerator
-import android.os.BatteryManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
-import android.os.PowerManager
-import android.os.VibrationEffect
-import android.os.Vibrator
+import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import com.lifelog.phone.BuildConfig
 import com.lifelog.phone.R
 import com.lifelog.phone.data.SettingsRepository
+import com.lifelog.phone.data.local.PhoneLogDao
+import com.lifelog.phone.data.local.PhoneLogEntity
+import com.lifelog.phone.data.local.SpeakerProfileDao
+import com.lifelog.phone.data.local.SpeakerProfileEntity
 import com.lifelog.phone.data.remote.LifeLogApi
+import com.lifelog.phone.data.speaker.EcapaEmbeddingEngine
+import com.lifelog.phone.data.speaker.SpeakerClusterAssigner
+import com.lifelog.phone.data.whisper.WhisperEngine
 import com.lifelog.phone.presentation.MainActivity
 import dagger.hilt.android.AndroidEntryPoint
-import java.io.ByteArrayOutputStream
-import java.io.File
-import java.io.FileOutputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.util.Locale
-import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
-import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
+import javax.inject.Inject
 
 private const val TAG = "WakeWordService"
-// How often to upload logger chunks when on cellular and not charging (5 minutes)
-private const val CELLULAR_LOGGER_INTERVAL_MS = 5L * 60L * 1000L
 private const val CHANNEL_ID = "wake_word_channel"
 private const val NOTIFICATION_ID = 1003
-private const val WAKEWORD_SENSITIVITY = 0.55f
-private const val CAPTURE_MAX_SECONDS = 7
-private const val CAPTURE_MIN_SECONDS = 1
-private const val CAPTURE_SILENCE_THRESHOLD = 500.0
-private const val CAPTURE_EMPTY_COOLDOWN_MS = 2500L
-private const val POST_REPLY_COOLDOWN_MS = 1200L
 
 @AndroidEntryPoint
 class WakeWordService : Service(), TextToSpeech.OnInitListener {
 
     companion object {
-        const val ACTION_WAKE_STATE = "com.lifelog.phone.WAKE_STATE"
-        const val EXTRA_STATE = "state"
-        const val EXTRA_DETAIL = "detail"
+        const val ACTION_WAKE_STATE     = "com.lifelog.phone.WAKE_STATE"
+        const val EXTRA_STATE           = "state"
+        const val EXTRA_DETAIL          = "detail"
+        const val ACTION_START_LISTENING = "com.lifelog.phone.action.WAKEWORD_START"
+        const val ACTION_STOP_LISTENING  = "com.lifelog.phone.action.WAKEWORD_STOP"
+
+        private const val SAMPLE_RATE   = 16_000
+        private const val CHUNK_MS      = 10_000L           // 10 s per transcription chunk
+        private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_MS / 1000).toInt()
+        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2 // PCM-16 → 2 bytes/sample
+
+        private val WAKE_PHRASES = listOf("lifelog", "life log", "hey lifelog", "hey life log")
+
+        // Mean absolute amplitude (0-1 scale) below which a chunk is considered silent.
+        // 0.005 ≈ very quiet room; lower = more sensitive, more Whisper calls on silence.
+        private const val VAD_THRESHOLD = 0.005
     }
 
     @Inject lateinit var settingsRepository: SettingsRepository
     @Inject lateinit var lifeLogApi: LifeLogApi
+    @Inject lateinit var phoneLogDao: PhoneLogDao
+    @Inject lateinit var speakerProfileDao: SpeakerProfileDao
+    @Inject lateinit var speakerClusterAssigner: SpeakerClusterAssigner
+    @Inject lateinit var ecapaEmbeddingEngine: EcapaEmbeddingEngine
+    @Inject lateinit var whisperEngine: WhisperEngine
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    private val running = AtomicBoolean(false)
-    private val inFlight = AtomicBoolean(false)
-    private val loggerInFlight = AtomicBoolean(false)
-    private val lastCellularUploadMs = AtomicLong(0L)
+    private val scope       = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    private var porcupine: Porcupine? = null
-    private var audioRecord: AudioRecord? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var notificationManager: NotificationManager? = null
+    private var audioManager: AudioManager? = null
 
-    private var cooldownUntilMs: Long = 0L
-    private var wakeSessionId: String = "wake_${UUID.randomUUID().toString().replace("-", "")}"
-    private var loggerBuf: ShortArray? = null
-    private var loggerPos = 0
-    @Volatile private var onSpeechDone: (() -> Unit)? = null
+    @Volatile private var listening = false
+    @Volatile private var wakeInFlight = false
+    private var wakeSessionId = newSessionId()
+    private var audioRecord: AudioRecord? = null
+    private var recordingThread: Thread? = null
+    private val processingBusy = AtomicBoolean(false)
+
+    // ── Lifecycle ──────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
+        Log.i(TAG, "onCreate")
         notificationManager = getSystemService(NotificationManager::class.java)
+        audioManager        = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         createChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("Starting wakeword..."))
-        setWakeStatus("Starting", "Initializing")
+        startForeground(NOTIFICATION_ID, buildNotification("Starting…"))
         initTts()
-        startDetector()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!running.get()) startDetector()
-        return START_STICKY
+        Log.i(TAG, "onStartCommand action=${intent?.action ?: "<null>"} listening=$listening")
+        when (intent?.action) {
+            ACTION_START_LISTENING -> {
+                if (!listening) {
+                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                        == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        Log.i(TAG, "start requested, beginning audio capture")
+                        startAudioCapture()
+                    } else {
+                        Log.w(TAG, "start requested without microphone permission")
+                        setWakeStatus("Error", "Microphone permission required")
+                    }
+                }
+            }
+            ACTION_STOP_LISTENING -> stopCapture()
+            else -> stopSelf()   // ignore sticky/implicit restarts
+        }
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
         super.onDestroy()
-        running.set(false)
-        try { audioRecord?.stop() } catch (_: Exception) {}
-        try { audioRecord?.release() } catch (_: Exception) {}
-        audioRecord = null
-        try { porcupine?.delete() } catch (_: Exception) {}
-        porcupine = null
-        ttsReady = false
-        tts?.stop()
-        tts?.shutdown()
-        tts = null
-        onSpeechDone = null
+        stopCapture()
+        tts?.stop(); tts?.shutdown(); tts = null
         scope.cancel()
     }
 
+    // ── AudioRecord capture loop ───────────────────────────────────────────────
+
+    private fun startAudioCapture() {
+        if (listening) return
+        Log.i(TAG, "startAudioCapture")
+        val minBuf = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuf <= 0) {
+            Log.e(TAG, "AudioRecord min buffer unavailable: $minBuf")
+            setWakeStatus("Error", "AudioRecord unavailable on this device")
+            return
+        }
+        val rec = AudioRecord(
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            maxOf(minBuf * 4, CHUNK_BYTES)
+        )
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            Log.e(TAG, "AudioRecord init failed")
+            rec.release()
+            return
+        }
+        audioRecord = rec
+        listening   = true
+        rec.startRecording()
+        setWakeStatus("Listening", "Always-on transcription active")
+
+        recordingThread = Thread {
+            val buf    = ByteArray(CHUNK_BYTES)
+            var offset = 0
+            var chunkCount = 0
+            Log.i(TAG, "recording thread started, CHUNK_BYTES=$CHUNK_BYTES")
+            while (listening) {
+                val toRead = CHUNK_BYTES - offset
+                val n = rec.read(buf, offset, toRead)
+                if (n < 0) {
+                    Log.w(TAG, "AudioRecord.read returned error $n — stopping")
+                    break
+                }
+                if (n == 0) { Thread.sleep(10); continue }
+                offset += n
+                if (offset < CHUNK_BYTES) continue   // chunk not full yet
+
+                val chunk = buf.copyOf(CHUNK_BYTES)
+                offset = 0
+                chunkCount++
+
+                val energy = chunkEnergy(chunk)
+                Log.d(TAG, "chunk #$chunkCount energy=${"%.4f".format(energy)} busy=${processingBusy.get()}")
+
+                // Skip if silent — avoids wasting Whisper cycles on quiet rooms
+                if (energy < VAD_THRESHOLD) {
+                    Log.d(TAG, "chunk #$chunkCount silent (energy=${"%.4f".format(energy)} < $VAD_THRESHOLD), skipping")
+                    continue
+                }
+
+                // Skip if still transcribing the previous chunk
+                if (!processingBusy.compareAndSet(false, true)) {
+                    Log.d(TAG, "chunk #$chunkCount: still processing previous, skipping")
+                    continue
+                }
+
+                scope.launch(Dispatchers.IO) {
+                    try { processChunk(chunk) }
+                    catch (e: Exception) { Log.e(TAG, "processChunk error: ${e.message}", e) }
+                    finally { processingBusy.set(false) }
+                }
+            }
+            Log.i(TAG, "recording thread exited after $chunkCount chunks")
+        }.also { it.isDaemon = true; it.start() }
+    }
+
+    private fun stopCapture() {
+        listening = false
+        recordingThread?.interrupt()
+        recordingThread = null
+        audioRecord?.stop()
+        audioRecord?.release()
+        audioRecord = null
+        wakeInFlight = false
+        stopSelf()
+    }
+
+    // ── Chunk processing: Whisper + ECAPA + DB ─────────────────────────────────
+
+    private suspend fun processChunk(pcm: ByteArray) {
+        if (!whisperEngine.isReady()) {
+            Log.d(TAG, "Whisper model not yet downloaded, skipping chunk")
+            return
+        }
+
+        // 1 — Transcribe
+        val rawText = whisperEngine.transcribePcm16(pcm).trim()
+        if (rawText.length < 6) { Log.d(TAG, "too short, skipping: '$rawText'"); return }
+
+        // Filter common Whisper hallucinations on quiet/ambient audio
+        val text = rawText
+        if (isLikelyHallucination(text)) { Log.d(TAG, "hallucination filtered: '$text'"); return }
+        Log.i(TAG, "transcript: $text")
+
+        // 2 — ECAPA speaker embedding from the same PCM buffer
+        val quality   = ecapaEmbeddingEngine.assessPcm16Quality(pcm)
+        val embedding = if (quality.isUsable) ecapaEmbeddingEngine.embedFromRecognizerBuffer(pcm) else null
+        val threshold = if (quality.isUsable) (0.84 + (1.0 - quality.score) * 0.08).coerceIn(0.84, 0.92) else null
+
+        // 3 — Speaker assignment
+        val ts       = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").format(java.time.LocalDateTime.now())
+        val slot     = normalizedSpeakerSlot(settingsRepository.cachedActiveSpeakerSlot)
+        val recent   = phoneLogDao.getByKind("transcript", 80)
+        val profiles = speakerProfileDao.getAll()
+        val decision = speakerClusterAssigner.assign(
+            transcriptText    = text,
+            transcriptTs      = ts,
+            activeSlot        = slot,
+            recentTranscripts = recent,
+            profiles          = profiles,
+            embeddingSimilarity = if (embedding == null) null else { profile ->
+                val pv = ecapaEmbeddingEngine.parse(profile.embedding)
+                if (pv == null) 0.0 else ecapaEmbeddingEngine.cosine(embedding, pv)
+            },
+            embeddingThresholdOverride = threshold,
+        )
+
+        // 4 — Persist to DB
+        phoneLogDao.insert(
+            PhoneLogEntity(
+                id                = System.currentTimeMillis(),
+                ts                = ts,
+                deviceId          = Build.MODEL,
+                kind              = "transcript",
+                text              = text,
+                transcriptId      = 0L,
+                sourceType        = "on_device_asr",
+                speakerId         = decision.speakerId,
+                speakerConfidence = decision.confidence,
+                tags              = "",
+                importance        = 0.8,
+                mediaLikelihood   = 0.0,
+                dialogDensity     = 0.0,
+                source            = "whisper_audiorecord",
+                speakerClusterId  = decision.clusterId,
+            )
+        )
+
+        // 5 — Update speaker profile embedding (running average)
+        if (decision.clusterId.isNotBlank()) {
+            val current     = speakerProfileDao.getByClusterId(decision.clusterId)
+            val existingVec = current?.embedding?.let { ecapaEmbeddingEngine.parse(it) }
+            val blended     = if (embedding != null)
+                ecapaEmbeddingEngine.blendEmbeddings(existingVec, embedding, current?.sampleCount ?: 0)
+            else existingVec
+            speakerProfileDao.upsert(
+                SpeakerProfileEntity(
+                    clusterId   = decision.clusterId,
+                    displayName = decision.speakerId,
+                    embedding   = blended?.let { ecapaEmbeddingEngine.serialize(it) } ?: (current?.embedding ?: ""),
+                    sampleCount = (current?.sampleCount ?: 0) + 1,
+                    updatedAtMs = System.currentTimeMillis(),
+                )
+            )
+        }
+
+        // 6 — Wake phrase check
+        if (containsWakePhrase(text) && !wakeInFlight) {
+            mainHandler.post { handleWake(text) }
+        }
+    }
+
+    // ── Voice Activity Detection ───────────────────────────────────────────────
+
+    private fun chunkEnergy(pcm: ByteArray): Double {
+        if (pcm.size < 3200) return 0.0
+        var sum = 0L
+        var i = 0
+        while (i + 1 < pcm.size) {
+            val lo = pcm[i].toInt() and 0xFF
+            val hi = pcm[i + 1].toInt()
+            val s  = (hi shl 8) or lo
+            sum += if (s < 0) -s.toLong() else s.toLong()
+            i += 2
+        }
+        return (sum.toDouble() / (pcm.size / 2)) / 32768.0
+    }
+
+    private fun isLikelyHallucination(text: String): Boolean {
+        val clean = text.trim().lowercase()
+        if (clean.isBlank()) return true
+        if (clean.length < 6) return true
+        val tokens = clean.split(Regex("\\s+"))
+        if (tokens.size >= 6) {
+            val uniq = tokens.toSet().size
+            if (uniq <= 2) return true
+        }
+        return Regex("(.)\\1{5,}").containsMatchIn(clean)
+    }
+
+    // ── Wake flow ──────────────────────────────────────────────────────────────
+
+    private fun containsWakePhrase(text: String): Boolean {
+        val lower = text.lowercase().trim()
+        return WAKE_PHRASES.any { lower.contains(it) }
+    }
+
+    private fun handleWake(rawText: String) {
+        wakeInFlight = true
+        setWakeStatus("Wake detected", "Thinking…")
+        Log.i(TAG, "Wake phrase detected: $rawText")
+
+        val query = WAKE_PHRASES.fold(rawText.lowercase()) { acc, p -> acc.replace(p, "") }
+            .trim().replaceFirstChar { it.uppercase() }
+        val prompt  = query.ifBlank { "What's going on?" }
+        val baseUrl = settingsRepository.cachedLifeLogSyncUrl
+            .ifBlank { settingsRepository.lifeLogSyncUrl }.trim()
+
+        scope.launch(Dispatchers.IO) {
+            val result = lifeLogApi.chatWithMeta(baseUrl = baseUrl, text = prompt, sessionId = wakeSessionId)
+            val reply  = result.getOrNull()?.reply?.trim()
+                ?: result.exceptionOrNull()?.message?.take(80)
+                ?: "Sorry, something went wrong."
+            mainHandler.post {
+                setWakeStatus("Speaking", "Replying")
+                speak(reply)
+                sendBroadcast(Intent("com.lifelog.phone.REFRESH_CHAT").apply {
+                    setPackage(packageName); putExtra("new_message", "true")
+                })
+            }
+        }
+    }
+
+    private fun speak(text: String) {
+        val msg = text.take(1200).trim()
+        if (msg.isEmpty() || !ttsReady || tts == null) {
+            wakeInFlight = false
+            return
+        }
+        val rc = tts?.speak(msg, TextToSpeech.QUEUE_FLUSH, null, "lifelog_wake_reply")
+        if (rc == TextToSpeech.ERROR) wakeInFlight = false
+        // Safety timeout in case TTS completion callback is missed
+        mainHandler.postDelayed({ if (wakeInFlight) { wakeInFlight = false; wakeSessionId = newSessionId() } }, 12_000L)
+    }
+
+    // ── TTS ────────────────────────────────────────────────────────────────────
+
     override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
+        ttsReady = status == TextToSpeech.SUCCESS
+        if (ttsReady) {
             tts?.language = Locale.US
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {}
-
-                override fun onDone(utteranceId: String?) {
-                    if (utteranceId == "lifelog_wake_reply") finishSpeechTurn()
+                override fun onStart(id: String?) {}
+                override fun onDone(id: String?) {
+                    mainHandler.post {
+                        wakeInFlight  = false
+                        wakeSessionId = newSessionId()
+                        setWakeStatus("Listening", "Always-on transcription active")
+                    }
                 }
-
-                override fun onError(utteranceId: String?) {
-                    if (utteranceId == "lifelog_wake_reply") finishSpeechTurn()
+                override fun onError(id: String?) {
+                    mainHandler.post { wakeInFlight = false }
                 }
             })
-            ttsReady = true
-            Log.i(TAG, "TTS ready")
-        } else {
-            ttsReady = false
-            Log.w(TAG, "TTS init failed status=$status")
-            setWakeStatus("Error", "TTS init failed")
         }
     }
 
     private fun initTts() {
-        try {
-            ttsReady = false
-            tts?.stop()
-            tts?.shutdown()
-        } catch (_: Exception) {
-        }
+        tts?.stop(); tts?.shutdown()
         tts = TextToSpeech(this, this)
     }
 
-    private fun startDetector() {
-        if (running.get()) return
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            setWakeStatus("Error", "Microphone permission required")
-            return
-        }
+    // ── Helpers ────────────────────────────────────────────────────────────────
 
-        running.set(true)
-        Thread {
-            try {
-                val builder = Porcupine.Builder()
-                    .setAccessKey(BuildConfig.PICOVOICE_ACCESS_KEY)
-                    .setSensitivity(WAKEWORD_SENSITIVITY)
-
-                val keywordPath = ensureAssetFile("lifelog.ppn")
-                builder.setKeywordPath(keywordPath)
-                porcupine = builder.build(this)
-            } catch (e: PorcupineException) {
-                Log.e(TAG, "Porcupine init failed", e)
-                running.set(false)
-                setWakeStatus("Error", "Wakeword init failed")
-                return@Thread
-            } catch (e: Exception) {
-                Log.e(TAG, "Wakeword asset setup failed", e)
-                running.set(false)
-                setWakeStatus("Error", "Wakeword init failed")
-                return@Thread
-            }
-
-            val p = porcupine ?: run {
-                running.set(false)
-                return@Thread
-            }
-
-            val sampleRate = p.sampleRate
-            val frameLength = p.frameLength
-            val bufferSize = AudioRecord.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            ).coerceAtLeast(frameLength * 4)
-
-            loggerBuf = ShortArray(sampleRate * 60)
-            loggerPos = 0
-
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufferSize
-            )
-
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                setWakeStatus("Error", "Microphone unavailable")
-                running.set(false)
-                return@Thread
-            }
-
-            try {
-                audioRecord?.startRecording()
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start recorder", e)
-                setWakeStatus("Error", "Recorder start failed")
-                running.set(false)
-                return@Thread
-            }
-
-            setWakeStatus("Listening", "Say 'LifeLog'")
-            Log.i(TAG, "Wake loop started")
-
-            val frame = ShortArray(frameLength)
-            while (running.get()) {
-                val read = audioRecord?.read(frame, 0, frameLength) ?: 0
-                if (read <= 0) {
-                    Thread.sleep(30)
-                    continue
-                }
-
-                appendLoggerSamples(frame, read, sampleRate)
-
-                val now = System.currentTimeMillis()
-                if (inFlight.get() || now < cooldownUntilMs) {
-                    continue
-                }
-
-                val keywordIndex = p.process(frame)
-                if (keywordIndex >= 0) {
-                    Log.i(TAG, "Wake detected")
-                    vibrate()
-                    playWakeTone()
-                    setWakeStatus("Wake detected", "Listening...")
-                    captureAndRespond(sampleRate)
-                }
-            }
-        }.start()
+    private fun normalizedSpeakerSlot(raw: String): String {
+        val clean = raw.trim().uppercase()
+        return if (clean.matches(Regex("S[0-9]+"))) clean else ""
     }
 
-    private fun captureAndRespond(sampleRate: Int) {
-        if (!inFlight.compareAndSet(false, true)) return
+    private fun isMediaPlaybackActive() = audioManager?.isMusicActive == true
 
-        val recorder = audioRecord ?: run {
-            inFlight.set(false)
-            return
-        }
+    private fun newSessionId() = "wake_${UUID.randomUUID().toString().replace("-", "")}"
 
-        val maxSeconds = CAPTURE_MAX_SECONDS
-        val minSeconds = CAPTURE_MIN_SECONDS
-        val maxSamples = sampleRate * maxSeconds
-        val pcm = ShortArray(maxSamples)
-        var offset = 0
-        var silenceFrames = 0
-        var speechSeen = false
-        val frame = (sampleRate / 10).coerceAtLeast(256)
-        val silenceThreshold = CAPTURE_SILENCE_THRESHOLD
-        setWakeStatus("Recording", "Capture query")
-
-        while (offset + frame <= maxSamples) {
-            val read = recorder.read(pcm, offset, frame)
-            if (read <= 0) continue
-            val rms = rms(pcm, offset, read)
-            if (rms > silenceThreshold) {
-                speechSeen = true
-                silenceFrames = 0
-            } else if (speechSeen) {
-                silenceFrames += 1
-            }
-            offset += read
-            val seconds = offset / sampleRate
-            if (speechSeen && seconds >= minSeconds && silenceFrames >= 5) {
-                break
-            }
-        }
-
-        if (offset < sampleRate / 2) {
-            inFlight.set(false)
-            cooldownUntilMs = System.currentTimeMillis() + CAPTURE_EMPTY_COOLDOWN_MS
-            setWakeStatus("Listening", "Didn't catch that. Say 'LifeLog' again")
-            return
-        }
-
-        val wav = toWav(pcm.copyOf(offset), sampleRate)
-        val baseUrl = settingsRepository.cachedBaseUrl.trim().trimEnd('/')
-        if (baseUrl.isEmpty()) {
-            inFlight.set(false)
-            setWakeStatus("Error", "Set server URL in Settings")
-            return
-        }
-
-        setWakeStatus("Thinking", "Contacting server")
-        scope.launch {
-            val result = withContext(Dispatchers.IO) {
-                lifeLogApi.voiceQuery(baseUrl, wav, sessionId = wakeSessionId)
-            }
-            result.onSuccess { (chatRes, _) ->
-                val out = chatRes.reply.trim()
-                if (out.isEmpty()) {
-                    inFlight.set(false)
-                    cooldownUntilMs = System.currentTimeMillis() + CAPTURE_EMPTY_COOLDOWN_MS
-                    setWakeStatus("Listening", "Say 'LifeLog'")
-                    return@onSuccess
-                }
-                setWakeStatus("Speaking", "Replying")
-                speak(out) {
-                    inFlight.set(false)
-                    cooldownUntilMs = System.currentTimeMillis() + POST_REPLY_COOLDOWN_MS
-                    setWakeStatus("Listening", "Say 'LifeLog'")
-                    // Notify chat app to refresh when wake word conversation completes
-                    val intent = Intent("com.lifelog.phone.REFRESH_CHAT").apply {
-                        putExtra("new_message", "true")
-                    }
-                    sendBroadcast(intent)
-                }
-            }.onFailure { e ->
-                Log.e(TAG, "Wake query failed: ${e.message}", e)
-                val detail = e.message?.take(40)?.ifBlank { null } ?: "Wake query failed"
-                setWakeStatus("Error", detail)
-                inFlight.set(false)
-                cooldownUntilMs = System.currentTimeMillis() + CAPTURE_EMPTY_COOLDOWN_MS
-                setWakeStatus("Listening", "Say 'LifeLog'")
-            }
-        }
-    }
-
-    private fun appendLoggerSamples(src: ShortArray, read: Int, sampleRate: Int) {
-        val buf = loggerBuf ?: return
-        var srcPos = 0
-        while (srcPos < read) {
-            val remain = buf.size - loggerPos
-            val n = minOf(remain, read - srcPos)
-            System.arraycopy(src, srcPos, buf, loggerPos, n)
-            loggerPos += n
-            srcPos += n
-            if (loggerPos >= buf.size) {
-                val chunk = buf.copyOf()
-                loggerPos = 0
-                postLoggerChunk(chunk, sampleRate)
-            }
-        }
-    }
-
-    private fun isOnWifi(): Boolean {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
-        val net = cm.activeNetwork ?: return false
-        val caps = cm.getNetworkCapabilities(net) ?: return false
-        return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-    }
-
-    private fun isCharging(): Boolean {
-        val bm = getSystemService(BatteryManager::class.java) ?: return false
-        return bm.isCharging
-    }
-
-    private fun isLowPowerMode(): Boolean {
-        val pm = getSystemService(PowerManager::class.java) ?: return false
-        return pm.isPowerSaveMode
-    }
-
-    private fun postLoggerChunk(pcm: ShortArray, sampleRate: Int) {
-        if (!loggerInFlight.compareAndSet(false, true)) return
-        // Skip logging when media/music is actively playing on the device to avoid
-        // transcribing YouTube, podcasts, etc. into the personal log.
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        if (audioManager?.isMusicActive == true) {
-            loggerInFlight.set(false)
-            return
-        }
-        // Upload policy based on connectivity and power state:
-        //   WiFi                           → upload every chunk (normal rate)
-        //   Cellular + charging            → upload every chunk (same as WiFi)
-        //   Cellular + low power mode      → skip entirely
-        //   Cellular + not charging        → throttle to CELLULAR_LOGGER_INTERVAL_MS
-        val onWifi = isOnWifi()
-        if (!onWifi) {
-            val charging = isCharging()
-            if (!charging && isLowPowerMode()) {
-                loggerInFlight.set(false)
-                return
-            }
-            if (!charging) {
-                val now = System.currentTimeMillis()
-                if (now - lastCellularUploadMs.get() < CELLULAR_LOGGER_INTERVAL_MS) {
-                    loggerInFlight.set(false)
-                    return
-                }
-            }
-        }
-        val baseUrl = settingsRepository.cachedBaseUrl.trim().trimEnd('/')
-        if (baseUrl.isEmpty()) {
-            loggerInFlight.set(false)
-            return
-        }
-        val token = settingsRepository.cachedToken
-        val wav = toWav(pcm, sampleRate)
-
-        val isCellular = !onWifi
-        scope.launch(Dispatchers.IO) {
-            try {
-                val client = OkHttpClient()
-                val reqBuilder = Request.Builder()
-                    .url("$baseUrl/phone/logger/upload_wav")
-                    .post(wav.toRequestBody("audio/wav".toMediaType()))
-                if (token.isNotEmpty()) reqBuilder.addHeader("X-Phone-Token", token)
-                client.newCall(reqBuilder.build()).execute().close()
-                if (isCellular) lastCellularUploadMs.set(System.currentTimeMillis())
-            } catch (e: Exception) {
-                Log.e(TAG, "Logger upload failed: ${e.message}")
-            } finally {
-                loggerInFlight.set(false)
-            }
-        }
-    }
-
-    private fun ensureAssetFile(name: String): String {
-        val outFile = File(filesDir, name)
-        if (outFile.exists() && outFile.length() > 0) return outFile.absolutePath
-        assets.open(name).use { input ->
-            FileOutputStream(outFile).use { output ->
-                val buf = ByteArray(8192)
-                while (true) {
-                    val read = input.read(buf)
-                    if (read <= 0) break
-                    output.write(buf, 0, read)
-                }
-                output.flush()
-            }
-        }
-        return outFile.absolutePath
-    }
-
-    private fun rms(buf: ShortArray, start: Int, len: Int): Double {
-        var sum = 0.0
-        for (i in 0 until len) {
-            val v = buf[start + i].toDouble()
-            sum += v * v
-        }
-        return kotlin.math.sqrt(sum / len)
-    }
-
-    private fun toWav(pcm: ShortArray, sampleRate: Int): ByteArray {
-        val bos = ByteArrayOutputStream()
-        val byteRate = sampleRate * 2
-        val dataLen = pcm.size * 2
-        val totalLen = 36 + dataLen
-
-        fun writeStr(s: String) { bos.write(s.toByteArray(Charsets.US_ASCII)) }
-        fun writeInt(v: Int) { bos.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(v).array()) }
-        fun writeShort(v: Short) { bos.write(ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort(v).array()) }
-
-        writeStr("RIFF")
-        writeInt(totalLen)
-        writeStr("WAVE")
-        writeStr("fmt ")
-        writeInt(16)
-        writeShort(1)
-        writeShort(1)
-        writeInt(sampleRate)
-        writeInt(byteRate)
-        writeShort(2)
-        writeShort(16)
-        writeStr("data")
-        writeInt(dataLen)
-
-        val bb = ByteBuffer.allocate(dataLen).order(ByteOrder.LITTLE_ENDIAN)
-        for (s in pcm) bb.putShort(s)
-        bos.write(bb.array())
-        return bos.toByteArray()
-    }
-
-    private fun speak(text: String, onDone: () -> Unit) {
-        val msg = ttsFriendlyText(text)
-        if (msg.isEmpty()) {
-            onDone()
-            return
-        }
-        onSpeechDone = onDone
-        if (!ttsReady || tts == null) {
-            Log.w(TAG, "TTS not ready, reinitializing")
-            initTts()
-            scope.launch {
-                repeat(10) {
-                    delay(100)
-                    if (ttsReady) {
-                        val rc = tts?.speak(msg, TextToSpeech.QUEUE_FLUSH, null, "lifelog_wake_reply")
-                        if (rc == TextToSpeech.ERROR) {
-                            Log.e(TAG, "TTS speak failed after reinit")
-                            setWakeStatus("Error", "TTS speak failed")
-                            finishSpeechTurn()
-                        }
-                        return@launch
-                    }
-                }
-                Log.e(TAG, "TTS never became ready; skipping speech")
-                setWakeStatus("Error", "TTS unavailable")
-                finishSpeechTurn()
-            }
-            return
-        }
-        val rc = tts?.speak(msg, TextToSpeech.QUEUE_FLUSH, null, "lifelog_wake_reply")
-        if (rc == TextToSpeech.ERROR) {
-            Log.e(TAG, "TTS speak returned ERROR; retrying after reinit")
-            setWakeStatus("Error", "TTS speak failed")
-            initTts()
-            finishSpeechTurn()
-            return
-        }
-        // Safety release in case TTS callback is lost on certain OEM builds.
-        scope.launch {
-            delay(10_000)
-            finishSpeechTurn()
-        }
-    }
-
-    private fun finishSpeechTurn() {
-        val callback = onSpeechDone ?: return
-        onSpeechDone = null
-        scope.launch(Dispatchers.Main) {
-            callback()
-        }
-    }
-
-    private fun ttsFriendlyText(input: String, maxChars: Int = 1200): String {
-        val text = input.trim()
-        if (text.isEmpty()) return ""
-        if (text.length <= maxChars) return text
-        val clipped = text.substring(0, maxChars)
-        val cut = maxOf(clipped.lastIndexOf('.'), clipped.lastIndexOf('!'), clipped.lastIndexOf('?'))
-        return if (cut >= maxChars / 2) clipped.substring(0, cut + 1).trim() else clipped.trim()
-    }
-
-    private fun vibrate() {
-        try {
-            val vib = getSystemService(Vibrator::class.java) ?: return
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vib.vibrate(VibrationEffect.createOneShot(70, VibrationEffect.DEFAULT_AMPLITUDE))
-            } else {
-                @Suppress("DEPRECATION")
-                vib.vibrate(70)
-            }
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun playWakeTone() {
-        try {
-            val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 70)
-            tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 130)
-            scope.launch(Dispatchers.IO) {
-                delay(220)
-                try {
-                    tone.release()
-                } catch (_: Exception) {
-                }
-            }
-        } catch (_: Exception) {
-        }
-    }
+    // ── Notification ───────────────────────────────────────────────────────────
 
     private fun createChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val channel = NotificationChannel(CHANNEL_ID, "Wake Word", NotificationManager.IMPORTANCE_LOW)
-        notificationManager?.createNotificationChannel(channel)
+        notificationManager?.createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, "Wake Word", NotificationManager.IMPORTANCE_LOW)
+        )
     }
 
     private fun buildNotification(text: String): Notification {
-        val openIntent = Intent(this, MainActivity::class.java)
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            openIntent,
+        val pi = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("LifeLog Wake")
+            .setContentTitle("LifeLog")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
+            .setOngoing(true).setOnlyAlertOnce(true)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setContentIntent(pendingIntent)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setContentIntent(pi).setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
-    }
-
-    private fun updateNotification(text: String) {
-        notificationManager?.notify(NOTIFICATION_ID, buildNotification(text))
     }
 
     private fun setWakeStatus(state: String, detail: String) {
         val msg = "$state: $detail"
         Log.i(TAG, msg)
-        updateNotification(msg)
-        val intent = Intent(ACTION_WAKE_STATE).apply {
+        notificationManager?.notify(NOTIFICATION_ID, buildNotification(msg))
+        sendBroadcast(Intent(ACTION_WAKE_STATE).apply {
             setPackage(packageName)
-            putExtra(EXTRA_STATE, state)
-            putExtra(EXTRA_DETAIL, detail)
+            putExtra(EXTRA_STATE, state); putExtra(EXTRA_DETAIL, detail)
             putExtra("ts", System.currentTimeMillis())
-        }
-        sendBroadcast(intent)
+        })
     }
 }

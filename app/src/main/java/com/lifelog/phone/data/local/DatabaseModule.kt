@@ -29,4 +29,16 @@ object DatabaseModule {
 
     @Provides
     fun provideFactDao(database: AppDatabase): FactDao = database.factDao()
+
+    @Provides
+    fun providePhoneLogDao(database: AppDatabase): PhoneLogDao = database.phoneLogDao()
+
+    @Provides
+    fun provideSpeakerProfileDao(database: AppDatabase): SpeakerProfileDao = database.speakerProfileDao()
+
+    @Provides
+    fun provideCalendarEventDao(database: AppDatabase): CalendarEventDao = database.calendarEventDao()
+
+    @Provides
+    fun provideRoutineDao(database: AppDatabase): RoutineDao = database.routineDao()
 }

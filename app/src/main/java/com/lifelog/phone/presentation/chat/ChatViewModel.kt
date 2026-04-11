@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.net.Uri
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -78,8 +80,30 @@ class ChatViewModel @Inject constructor(
     private var activeSessionId: String = newSessionId()
     private var mediaPlayer: MediaPlayer? = null
     private var audioUpdateJob: kotlinx.coroutines.Job? = null
+    private var textToSpeech: TextToSpeech? = null
+    private var textToSpeechReady = false
 
     init {
+        textToSpeech = TextToSpeech(context.applicationContext) { status ->
+            textToSpeechReady = status == TextToSpeech.SUCCESS
+            if (textToSpeechReady) {
+                textToSpeech?.language = Locale.US
+                textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {
+                        _isAudioPlaying.value = true
+                    }
+
+                    override fun onDone(utteranceId: String?) {
+                        _isAudioPlaying.value = false
+                    }
+
+                    override fun onError(utteranceId: String?) {
+                        _isAudioPlaying.value = false
+                        _errorMessage.value = "TTS playback failed"
+                    }
+                })
+            }
+        }
         runInitialLoad()
         startConversationSync()
     }
@@ -89,6 +113,9 @@ class ChatViewModel @Inject constructor(
         mediaPlayer?.stop()
         mediaPlayer?.release()
         mediaPlayer = null
+        textToSpeech?.stop()
+        textToSpeech?.shutdown()
+        textToSpeech = null
     }
 
     private fun runInitialLoad() {
@@ -99,8 +126,10 @@ class ChatViewModel @Inject constructor(
     }
 
     fun playAudio(stem: String, timestamp: String = "") {
-        val baseUrl = settingsRepository.cachedBaseUrl.ifBlank { settingsRepository.baseUrl }
-        val token = settingsRepository.cachedToken.ifBlank { settingsRepository.token }
+        val baseUrl = settingsRepository.cachedLifeLogSyncUrl
+            .ifBlank { settingsRepository.lifeLogSyncUrl }
+        val token = settingsRepository.cachedLifeLogSyncToken
+            .ifBlank { settingsRepository.lifeLogSyncToken }
         if (baseUrl.isBlank() || stem.isBlank()) {
             Log.e(TAG, "playAudio: missing baseUrl=$baseUrl or stem=$stem")
             _errorMessage.value = "Missing server URL"
@@ -257,6 +286,23 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    fun stopSpeech() {
+        mediaPlayer?.let {
+            try {
+                if (it.isPlaying) it.stop()
+            } catch (_: Exception) {
+            }
+            it.release()
+            if (mediaPlayer == it) mediaPlayer = null
+        }
+        audioUpdateJob?.cancel()
+        textToSpeech?.stop()
+        _isAudioPlaying.value = false
+        _currentAudioFile.value = null
+        _audioPosition.value = 0L
+        _audioDuration.value = 0L
+    }
+
     fun saveAudioClip(fileName: String = "lifelog_clip_${System.currentTimeMillis()}.wav") {
         _currentAudioFile.value?.let { file ->
             try {
@@ -290,120 +336,21 @@ class ChatViewModel @Inject constructor(
     }
 
     fun playTTS(text: String) {
-        val baseUrl = settingsRepository.cachedBaseUrl.ifBlank { settingsRepository.baseUrl }
-        val token = settingsRepository.cachedToken.ifBlank { settingsRepository.token }
-        if (baseUrl.isBlank() || text.isBlank()) {
-            _errorMessage.value = "Missing server URL or text"
-            Log.e(TAG, "playTTS: baseUrl=$baseUrl, token=${token.take(10)}...")
+        val cleanText = text.trim()
+        if (cleanText.isBlank()) {
+            _errorMessage.value = "Missing text for TTS"
             return
         }
-
-        val encodedText = Uri.encode(text)
-        val url = if (baseUrl.endsWith("/")) {
-            "${baseUrl}tts?text=$encodedText"
-        } else {
-            "$baseUrl/tts?text=$encodedText"
+        if (!textToSpeechReady || textToSpeech == null) {
+            _errorMessage.value = "Android TTS is not ready yet"
+            return
         }
-
-        Log.i(TAG, "playTTS: baseUrl=$baseUrl, token=${token.take(10)}..., url=$url")
-
-        viewModelScope.launch {
-            try {
-                val tempFile = withContext(Dispatchers.IO) {
-                    // Download audio file first using OkHttp (which includes auth headers)
-                    val client = OkHttpClient()
-                val req = Request.Builder()
-                    .url(url)
-                    .header("Authorization", "Bearer $token")
-                    .header("X-Phone-Token", token)
-                    .build()
-
-                    Log.i(TAG, "playTTS: downloading from $url with auth headers")
-                    val response = client.newCall(req).execute()
-
-                    if (!response.isSuccessful) {
-                        Log.e(TAG, "playTTS: HTTP error ${response.code}")
-                        _errorMessage.value = "Server error: ${response.code}"
-                        return@withContext null
-                    }
-
-                    val audioData = response.body?.bytes()
-                    if (audioData == null || audioData.isEmpty()) {
-                        Log.e(TAG, "playTTS: empty response")
-                        _errorMessage.value = "No audio data received"
-                        return@withContext null
-                    }
-
-                    // Save to temp file
-                    val file = java.io.File(context.cacheDir, "tts_${System.currentTimeMillis()}.mp3")
-                    file.writeBytes(audioData)
-                    file
-                }
-
-                if (tempFile == null) return@launch
-
-                // Stop any existing playback
-                mediaPlayer?.let {
-                    try {
-                        if (it.isPlaying) it.stop()
-                    } catch (_: Exception) {}
-                    it.release()
-                }
-                audioUpdateJob?.cancel()
-
-                // Store current file and reset state
-                _currentAudioFile.value = tempFile
-                _audioPosition.value = 0
-                _audioDuration.value = 0
-                _isAudioPlaying.value = false
-
-                val mp = MediaPlayer().apply {
-                    setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .build()
-                    )
-                    setDataSource(tempFile.absolutePath)
-                    prepareAsync()
-                    setOnPreparedListener {
-                        Log.i(TAG, "MediaPlayer TTS: prepared, duration=${it.duration}ms")
-                        _audioDuration.value = it.duration.toLong()
-                        // Speed up TTS playback to 1.5x
-                        try {
-                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                                it.playbackParams = android.media.PlaybackParams().setSpeed(1.5f)
-                            }
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Could not set playback speed", e)
-                        }
-                        it.start()
-                        _isAudioPlaying.value = true
-                        startAudioPositionUpdates()
-                    }
-                    setOnCompletionListener {
-                        it.release()
-                        if (mediaPlayer == it) mediaPlayer = null
-                        _isAudioPlaying.value = false
-                        audioUpdateJob?.cancel()
-                        try { tempFile.delete() } catch (_: Exception) {}
-                    }
-                    setOnErrorListener { innerMp, what, extra ->
-                        Log.e(TAG, "MediaPlayer TTS error: what=$what extra=$extra")
-                        _errorMessage.value = "TTS error: $what/$extra"
-                        _isAudioPlaying.value = false
-                        audioUpdateJob?.cancel()
-                        innerMp.release()
-                        if (mediaPlayer == innerMp) mediaPlayer = null
-                        try { tempFile.delete() } catch (_: Exception) {}
-                        true
-                    }
-                }
-                mediaPlayer = mp
-            } catch (e: Exception) {
-                Log.e(TAG, "playTTS exception: ${e.javaClass.simpleName}", e)
-                _errorMessage.value = "Error: ${e.javaClass.simpleName} - ${e.message ?: e.cause?.message ?: "Unknown error"}"
-            }
+        stopSpeech()
+        val utteranceId = "chat_tts_${System.currentTimeMillis()}"
+        val result = textToSpeech?.speak(cleanText, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+        if (result == TextToSpeech.ERROR) {
+            _errorMessage.value = "Android TTS could not start"
+            _isAudioPlaying.value = false
         }
     }
 
@@ -512,6 +459,7 @@ class ChatViewModel @Inject constructor(
     fun sendVoiceMessage(baseUrl: String, audioData: ByteArray) {
         currentBaseUrl = baseUrl
         viewModelScope.launch {
+            _isRecording.value = false
             _isLoading.value = true
 
             val userMsgPlaceholder = Message(role = "user", text = "🎤 Voice message")

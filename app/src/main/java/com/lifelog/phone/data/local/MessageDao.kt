@@ -13,6 +13,16 @@ interface MessageDao {
     @Query("SELECT * FROM messages ORDER BY timestamp ASC, id ASC LIMIT 100")
     suspend fun getAll(): List<MessageEntity>
 
+    @Query("SELECT * FROM messages ORDER BY timestamp DESC, id DESC LIMIT :limit")
+    suspend fun getRecent(limit: Int): List<MessageEntity>
+
+    @Query(
+        "SELECT * FROM messages " +
+            "WHERE text LIKE '%' || :query || '%' " +
+            "ORDER BY timestamp DESC, id DESC LIMIT :limit"
+    )
+    suspend fun search(query: String, limit: Int): List<MessageEntity>
+
     @Query("SELECT * FROM messages WHERE id = :id LIMIT 1")
     suspend fun getById(id: Long): MessageEntity?
 

@@ -9,6 +9,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.lifelog.phone.data.Fact
 import com.lifelog.phone.data.SettingsRepository
+import com.lifelog.phone.data.local.CalendarEventDao
+import com.lifelog.phone.data.local.FactDao
+import com.lifelog.phone.data.local.PhoneLogDao
+import com.lifelog.phone.data.local.RoutineDao
 import com.lifelog.phone.data.remote.CalendarEventItem
 import com.lifelog.phone.data.remote.CalendarSyncEvent
 import com.lifelog.phone.data.remote.LifeLogApi
@@ -42,6 +46,10 @@ data class LogTypeOption(
 class DashboardViewModel @Inject constructor(
     private val api: LifeLogApi,
     private val settingsRepository: SettingsRepository,
+    private val factDao: FactDao,
+    private val phoneLogDao: PhoneLogDao,
+    private val calendarEventDao: CalendarEventDao,
+    private val routineDao: RoutineDao,
     @ApplicationContext private val context: Context
 ) : ViewModel() {
     private val TAG = "DashboardViewModel"
@@ -115,6 +123,94 @@ class DashboardViewModel @Inject constructor(
     private var currentRoutineQuery: String = ""
     private var mediaPlayer: MediaPlayer? = null
 
+    private suspend fun readLocalFacts() {
+        allFacts = factDao.getAll().map {
+            Fact(
+                id = it.id,
+                text = it.text.ifBlank { "(empty fact)" },
+                timestamp = it.timestamp
+            )
+        }.sortedByDescending { it.timestamp }
+        _facts.value = allFacts
+    }
+
+    private suspend fun readLocalLogs() {
+        val items = phoneLogDao.getRecent(240).map {
+            PhoneLogEvent(
+                id = it.id,
+                ts = it.ts,
+                deviceId = it.deviceId,
+                kind = it.kind,
+                text = it.text,
+                transcriptId = it.transcriptId,
+                sourceType = it.sourceType,
+                speakerId = it.speakerId,
+                speakerConfidence = it.speakerConfidence,
+                tags = it.tags,
+                importance = it.importance,
+                mediaLikelihood = it.mediaLikelihood,
+                dialogDensity = it.dialogDensity,
+                source = it.source
+            )
+        }
+        allLogs = compressStateChanges(items.sortedByDescending { it.ts })
+        rebuildLogTypeOptions()
+        rebuildSpeakerOptions()
+        applyLogFilters()
+    }
+
+    private suspend fun readLocalCalendar() {
+        allCalendarEvents = calendarEventDao.getAll(260).map {
+            CalendarEventItem(
+                id = it.id,
+                source = it.source,
+                remoteId = it.remoteId,
+                calendarId = it.calendarId,
+                title = it.title,
+                startTs = it.startTs,
+                endTs = it.endTs,
+                timezone = it.timezone,
+                recurrenceRule = it.recurrenceRule,
+                location = it.location,
+                notes = it.notes,
+                isAllDay = it.isAllDay,
+                status = it.status,
+                updatedAt = it.updatedAt,
+                display = it.display
+            )
+        }
+        applyCalendarFilters()
+    }
+
+    private suspend fun readLocalRoutines() {
+        val items = routineDao.getAll(260).map {
+            RoutineItem(
+                id = it.id,
+                title = it.title,
+                kind = it.kind,
+                anchorKey = it.anchorKey,
+                hourBucket = it.hourBucket,
+                weekdays = it.weekdays,
+                note = it.note,
+                confidence = it.confidence,
+                source = it.source,
+                active = it.active,
+                occurrences = it.occurrences,
+                firstSeenTs = it.firstSeenTs,
+                lastSeenTs = it.lastSeenTs,
+                updatedAt = it.updatedAt,
+                createdAt = it.createdAt,
+                display = it.display
+            )
+        }
+        allRoutines = items.sortedWith(
+            compareByDescending<RoutineItem> { it.active }
+                .thenByDescending { it.confidence }
+                .thenByDescending { it.updatedAt }
+        )
+        applyRoutineFilters()
+    }
+
     override fun onCleared() {
         super.onCleared()
         mediaPlayer?.stop()
@@ -123,8 +219,10 @@ class DashboardViewModel @Inject constructor(
     }
 
     fun playAudio(stem: String, timestamp: String = "") {
-        val baseUrl = settingsRepository.cachedBaseUrl.ifBlank { settingsRepository.baseUrl }
-        val token = settingsRepository.cachedToken.ifBlank { settingsRepository.token }
+        val baseUrl = settingsRepository.cachedLifeLogSyncUrl
+            .ifBlank { settingsRepository.lifeLogSyncUrl }
+        val token = settingsRepository.cachedLifeLogSyncToken
+            .ifBlank { settingsRepository.lifeLogSyncToken }
         if (baseUrl.isBlank() || stem.isBlank()) {
             Log.e(TAG, "playAudio: missing baseUrl=$baseUrl or stem=$stem")
             _error.value = "Missing server URL"
@@ -244,24 +342,16 @@ class DashboardViewModel @Inject constructor(
     }
 
     fun loadFacts(baseUrl: String) {
-        if (baseUrl.isBlank()) return
         currentBaseUrl = baseUrl.trim().trimEnd('/')
         viewModelScope.launch {
             _isLoadingFacts.value = true
-            api.getFacts(baseUrl = baseUrl, limit = 240)
-                .onSuccess { items ->
-                    allFacts = items.map { item ->
-                        Fact(
-                            id = item.id,
-                            text = item.fact.ifBlank { "(empty fact)" },
-                            timestamp = parseTimestamp(item.createdAt)
-                        )
-                    }.sortedByDescending { it.timestamp }
-                    _facts.value = allFacts
-                }
-                .onFailure { e ->
-                    _error.value = "Failed to load facts: ${e.message}"
-                }
+            if (currentBaseUrl.isNotBlank()) {
+                api.syncLocalMirror(currentBaseUrl)
+                    .onFailure { e ->
+                        _error.value = "Sync unavailable, showing local facts: ${e.message}"
+                    }
+            }
+            readLocalFacts()
             _isLoadingFacts.value = false
         }
     }
@@ -276,75 +366,66 @@ class DashboardViewModel @Inject constructor(
     }
 
     fun loadLogs(baseUrl: String) {
-        if (baseUrl.isBlank()) return
         currentBaseUrl = baseUrl.trim().trimEnd('/')
         viewModelScope.launch {
             _isLoadingLogs.value = true
-            api.getPhoneLogs(baseUrl = baseUrl, limit = 180)
-                .onSuccess { items ->
-                    allLogs = compressStateChanges(items.sortedByDescending { it.ts })
-                    refreshSpeakerOptionsFromServer(baseUrl)
-                    rebuildLogTypeOptions()
-                    rebuildSpeakerOptions()
-                    applyLogFilters()
-                }
-                .onFailure { e ->
-                    _error.value = "Failed to load logs: ${e.message}"
-                }
+            if (currentBaseUrl.isNotBlank()) {
+                api.syncLocalMirror(currentBaseUrl)
+                    .onFailure { e ->
+                        _error.value = "Sync unavailable, showing local logs: ${e.message}"
+                    }
+                refreshSpeakerOptionsFromServer(currentBaseUrl)
+            }
+            readLocalLogs()
             _isLoadingLogs.value = false
         }
     }
 
     fun loadCalendar(baseUrl: String, syncGoogle: Boolean = false) {
-        if (baseUrl.isBlank()) return
         currentBaseUrl = baseUrl.trim().trimEnd('/')
         viewModelScope.launch {
             _isLoadingCalendar.value = true
-            api.getCalendarEvents(baseUrl = baseUrl, limit = 260, syncGoogle = syncGoogle)
-                .onSuccess { items ->
-                    allCalendarEvents = items
-                    applyCalendarFilters()
-                }
-                .onFailure { e ->
-                    _error.value = "Failed to load calendar: ${e.message}"
-                }
+            if (currentBaseUrl.isNotBlank()) {
+                api.syncLocalMirror(currentBaseUrl)
+                    .onFailure { e ->
+                        _error.value = "Sync unavailable, showing local calendar: ${e.message}"
+                    }
+            }
+            readLocalCalendar()
             _isLoadingCalendar.value = false
         }
     }
 
     fun loadRoutines(baseUrl: String, detect: Boolean = true) {
-        if (baseUrl.isBlank()) return
         currentBaseUrl = baseUrl.trim().trimEnd('/')
         viewModelScope.launch {
             _isLoadingRoutines.value = true
-            api.getRoutines(baseUrl = baseUrl, limit = 260, detect = detect)
-                .onSuccess { items ->
-                    allRoutines = items.sortedWith(
-                        compareByDescending<RoutineItem> { it.active }
-                            .thenByDescending { it.confidence }
-                            .thenByDescending { it.updatedAt }
-                    )
-                    applyRoutineFilters()
-                }
-                .onFailure { e ->
-                    _error.value = "Failed to load routines: ${e.message}"
-                }
+            if (currentBaseUrl.isNotBlank()) {
+                api.syncLocalMirror(currentBaseUrl)
+                    .onFailure { e ->
+                        _error.value = "Sync unavailable, showing local routines: ${e.message}"
+                    }
+            }
+            readLocalRoutines()
             _isLoadingRoutines.value = false
         }
     }
 
     fun loadQuestions(baseUrl: String) {
-        if (baseUrl.isBlank()) return
         currentBaseUrl = baseUrl.trim().trimEnd('/')
         viewModelScope.launch {
             _isLoadingQuestions.value = true
-            api.getQuestions(baseUrl = baseUrl, limit = 20)
-                .onSuccess { items ->
-                    _qaItems.value = items
-                }
-                .onFailure { e ->
-                    _error.value = "Failed to load questions: ${e.message}"
-                }
+            if (currentBaseUrl.isBlank()) {
+                _qaItems.value = emptyList()
+            } else {
+                api.getQuestions(baseUrl = currentBaseUrl, limit = 20)
+                    .onSuccess { items ->
+                        _qaItems.value = items
+                    }
+                    .onFailure { e ->
+                        _error.value = "Failed to load questions: ${e.message}"
+                    }
+            }
             _isLoadingQuestions.value = false
         }
     }
@@ -389,69 +470,83 @@ class DashboardViewModel @Inject constructor(
 
     fun upsertFact(id: Long?, text: String, category: String) {
         val base = currentBaseUrl
-        if (base.isBlank()) {
-            _error.value = "Missing server URL"
-            return
-        }
         viewModelScope.launch {
+            if (base.isBlank()) {
+                runCatching {
+                    factDao.insert(com.lifelog.phone.data.local.FactEntity(
+                        id = id ?: 0L,
+                        text = text.trim(),
+                        timestamp = System.currentTimeMillis()
+                    ))
+                }.onSuccess { readLocalFacts() }
+                 .onFailure { e -> _error.value = "Fact save failed: ${e.message}" }
+                return@launch
+            }
             api.upsertFact(base, id, text, category)
-                .onSuccess {
-                    loadFacts(base)
-                }
-                .onFailure { e ->
-                    _error.value = "Fact save failed: ${e.message}"
-                }
+                .onSuccess { loadFacts(base) }
+                .onFailure { e -> _error.value = "Fact save failed: ${e.message}" }
         }
     }
 
     fun deleteFact(id: Long) {
         val base = currentBaseUrl
-        if (base.isBlank()) {
-            _error.value = "Missing server URL"
-            return
-        }
         viewModelScope.launch {
+            if (base.isBlank()) {
+                runCatching { factDao.deleteById(id) }
+                    .onSuccess { readLocalFacts() }
+                    .onFailure { e -> _error.value = "Fact delete failed: ${e.message}" }
+                return@launch
+            }
             api.deleteFact(base, id)
-                .onSuccess {
-                    loadFacts(base)
-                }
-                .onFailure { e ->
-                    _error.value = "Fact delete failed: ${e.message}"
-                }
+                .onSuccess { loadFacts(base) }
+                .onFailure { e -> _error.value = "Fact delete failed: ${e.message}" }
         }
     }
 
     fun upsertLog(id: Long?, kind: String, text: String, ts: String = "", deviceId: String = "") {
         val base = currentBaseUrl
-        if (base.isBlank()) {
-            _error.value = "Missing server URL"
-            return
-        }
         viewModelScope.launch {
+            if (base.isBlank()) {
+                runCatching {
+                    val nowTs = if (ts.isNotBlank()) ts else java.time.Instant.now().toString()
+                    phoneLogDao.insert(com.lifelog.phone.data.local.PhoneLogEntity(
+                        id = id ?: System.currentTimeMillis(),
+                        ts = nowTs,
+                        deviceId = deviceId.ifBlank { android.os.Build.MODEL },
+                        kind = kind.ifBlank { "note" },
+                        text = text.trim(),
+                        transcriptId = 0L,
+                        sourceType = "manual",
+                        speakerId = "",
+                        speakerConfidence = 0.0,
+                        tags = "",
+                        importance = 0.8,
+                        mediaLikelihood = 0.0,
+                        dialogDensity = 0.0,
+                        source = "local_manual",
+                    ))
+                }.onSuccess { readLocalLogs() }
+                 .onFailure { e -> _error.value = "Log save failed: ${e.message}" }
+                return@launch
+            }
             api.upsertLog(base, id, kind, text, ts, deviceId)
-                .onSuccess {
-                    loadLogs(base)
-                }
-                .onFailure { e ->
-                    _error.value = "Log save failed: ${e.message}"
-                }
+                .onSuccess { loadLogs(base) }
+                .onFailure { e -> _error.value = "Log save failed: ${e.message}" }
         }
     }
 
     fun deleteLog(id: Long) {
         val base = currentBaseUrl
-        if (base.isBlank()) {
-            _error.value = "Missing server URL"
-            return
-        }
         viewModelScope.launch {
+            if (base.isBlank()) {
+                runCatching { phoneLogDao.deleteByIds(listOf(id)) }
+                    .onSuccess { readLocalLogs() }
+                    .onFailure { e -> _error.value = "Log delete failed: ${e.message}" }
+                return@launch
+            }
             api.deleteLog(base, id)
-                .onSuccess {
-                    loadLogs(base)
-                }
-                .onFailure { e ->
-                    _error.value = "Log delete failed: ${e.message}"
-                }
+                .onSuccess { loadLogs(base) }
+                .onFailure { e -> _error.value = "Log delete failed: ${e.message}" }
         }
     }
 

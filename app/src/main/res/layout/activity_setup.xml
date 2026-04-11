@@ -36,7 +36,7 @@
         android:id="@+id/setupBaseUrl"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="Server URL (e.g. https://your-tunnel.trycloudflare.com)"
+        android:hint="Server URL (e.g. https://api.example.com)"
         android:inputType="textUri"
         android:layout_marginBottom="12dp"/>
 

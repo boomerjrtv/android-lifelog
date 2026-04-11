@@ -10,6 +10,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.provider.CalendarContract
 import android.location.Location
 import android.location.Geocoder
@@ -23,9 +26,14 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.RemoteInput
 import androidx.core.content.ContextCompat
 import dagger.hilt.android.AndroidEntryPoint
+import com.lifelog.phone.data.local.CalendarEventDao
+import com.lifelog.phone.data.local.CalendarEventEntity
+import com.lifelog.phone.data.local.PhoneLogDao
+import com.lifelog.phone.data.local.PhoneLogEntity
 import com.lifelog.phone.data.remote.CalendarSyncEvent
 import com.lifelog.phone.data.remote.LifeLogApi
 import com.lifelog.phone.data.MessageRepository
+import com.lifelog.phone.data.whisper.WhisperEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -42,11 +50,13 @@ import java.net.Inet4Address
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import org.json.JSONArray
 import org.json.JSONObject
@@ -60,6 +70,9 @@ class LifeLogService : Service() {
     @Inject lateinit var settingsRepository: com.lifelog.phone.data.SettingsRepository
     @Inject lateinit var lifeLogApi: LifeLogApi
     @Inject lateinit var messageRepository: MessageRepository
+    @Inject lateinit var phoneLogDao: PhoneLogDao
+    @Inject lateinit var calendarEventDao: CalendarEventDao
+    @Inject lateinit var whisperEngine: WhisperEngine
 
     private val scope = CoroutineScope(Dispatchers.IO + Job())
     private val client = OkHttpClient.Builder()
@@ -69,20 +82,58 @@ class LifeLogService : Service() {
     private val reminderPrefs by lazy {
         getSharedPreferences("lifelog_reminders", Context.MODE_PRIVATE)
     }
+    private val maintenancePrefs by lazy {
+        getSharedPreferences("lifelog_maintenance", Context.MODE_PRIVATE)
+    }
     private var dwellAnchorLat: Double? = null
     private var dwellAnchorLon: Double? = null
     private var dwellAnchorStartMs: Long = 0L
     private var lastDwellPromptLat: Double? = null
     private var lastDwellPromptLon: Double? = null
+    @Volatile private var transcriptionActive: Boolean = false
+    private var audioRecord: AudioRecord? = null
+    private var recordingThread: Thread? = null
+    private val transcriptionBusy = AtomicBoolean(false)
+    @Volatile private var pendingTranscriptionChunk: ByteArray? = null
 
     override fun onCreate() {
         super.onCreate()
         startForeground(NOTIFICATION_ID, createNotification())
         startHeartbeatLoop()
+        lifeLogApi.warmUpOnDeviceEngine()
+        lifeLogApi.ensureWhisperDownloaded()
+        scheduleTranscriptCleanup()
+    }
+
+    private fun startAlwaysOnTranscriptionIfPermitted() {
+        val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        Log.i("LifeLogService", "startAlwaysOnTranscriptionIfPermitted granted=$granted active=$transcriptionActive")
+        if (!granted) {
+            setWakeStatus("Mic", "Permission missing")
+            return
+        }
+        setWakeStatus("Mic", "Starting")
+        startTranscriptionCapture()
+    }
+
+    private fun scheduleTranscriptCleanup() {
+        val now = System.currentTimeMillis()
+        val lastRun = maintenancePrefs.getLong(KEY_TRANSCRIPT_CLEANUP_AT_MS, 0L)
+        if (now - lastRun < TRANSCRIPT_CLEANUP_INTERVAL_MS) return
+        scope.launch {
+            runCatching {
+                cleanupHistoricalTranscriptNoise()
+                maintenancePrefs.edit().putLong(KEY_TRANSCRIPT_CLEANUP_AT_MS, now).apply()
+            }.onFailure { e ->
+                Log.w("LifeLogService", "transcript cleanup failed: ${e.message}")
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            ACTION_TRANSCRIPTION_START -> startAlwaysOnTranscriptionIfPermitted()
+            ACTION_TRANSCRIPTION_STOP -> stopTranscriptionCapture()
             ACTION_LOCATION_CONFIRMATION -> {
                 scope.launch { handleLocationConfirmation(intent) }
             }
@@ -128,30 +179,298 @@ class LifeLogService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        stopTranscriptionCapture()
         scope.cancel()
     }
 
+    private fun startTranscriptionCapture() {
+        if (transcriptionActive) return
+        val minBuf = AudioRecord.getMinBufferSize(
+            TRANSCRIPTION_SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuf <= 0) {
+            Log.e("LifeLogService", "AudioRecord unavailable: $minBuf")
+            setWakeStatus("Mic", "Audio unavailable")
+            return
+        }
+        val rec = AudioRecord(
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            TRANSCRIPTION_SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            maxOf(minBuf * 4, TRANSCRIPTION_CHUNK_BYTES)
+        )
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            Log.e("LifeLogService", "AudioRecord init failed")
+            rec.release()
+            setWakeStatus("Mic", "Init failed")
+            return
+        }
+        audioRecord = rec
+        transcriptionActive = true
+        rec.startRecording()
+        Log.i("LifeLogService", "always-on transcription started")
+        setWakeStatus("Mic", "Running")
+        recordingThread = Thread {
+            val buf = ByteArray(TRANSCRIPTION_CHUNK_BYTES)
+            var offset = 0
+            while (transcriptionActive) {
+                val n = rec.read(buf, offset, TRANSCRIPTION_CHUNK_BYTES - offset)
+                if (n < 0) {
+                    Log.w("LifeLogService", "AudioRecord.read error $n")
+                    break
+                }
+                if (n == 0) {
+                    Thread.sleep(10)
+                    continue
+                }
+                offset += n
+                if (offset < TRANSCRIPTION_CHUNK_BYTES) continue
+                val chunk = buf.copyOf(TRANSCRIPTION_CHUNK_BYTES)
+                offset = 0
+                val energy = chunkEnergy(chunk)
+                Log.d("LifeLogService", "chunk captured, energy=${"%.4f".format(energy)}")
+                if (energy < TRANSCRIPTION_VAD_THRESHOLD) {
+                    Log.d("LifeLogService", "chunk silent (energy $energy < $TRANSCRIPTION_VAD_THRESHOLD), skipping")
+                    continue
+                }
+                if (!transcriptionBusy.compareAndSet(false, true)) {
+                    pendingTranscriptionChunk = chunk
+                    Log.d("LifeLogService", "transcription busy, queued latest chunk")
+                    continue
+                }
+                scope.launch {
+                    try {
+                        Log.d("LifeLogService", "starting transcription of chunk...")
+                        persistTranscriptChunk(chunk)
+                    } catch (e: Exception) {
+
+                        Log.e("LifeLogService", "persistTranscriptChunk error: ${e.message}", e)
+                    } finally {
+                        transcriptionBusy.set(false)
+                        drainPendingTranscriptionChunk()
+                    }
+                }
+            }
+            Log.i("LifeLogService", "always-on transcription thread exited")
+        }.also {
+            it.isDaemon = true
+            it.start()
+        }
+    }
+
+    private fun stopTranscriptionCapture() {
+        transcriptionActive = false
+        recordingThread?.interrupt()
+        recordingThread = null
+        runCatching { audioRecord?.stop() }
+        runCatching { audioRecord?.release() }
+        audioRecord = null
+        transcriptionBusy.set(false)
+        pendingTranscriptionChunk = null
+        Log.i("LifeLogService", "always-on transcription stopped")
+        setWakeStatus("Mic", "Stopped")
+    }
+
+    private fun drainPendingTranscriptionChunk() {
+        val next = pendingTranscriptionChunk ?: return
+        if (!transcriptionActive) {
+            pendingTranscriptionChunk = null
+            return
+        }
+        if (!transcriptionBusy.compareAndSet(false, true)) return
+        pendingTranscriptionChunk = null
+        scope.launch {
+            try {
+                Log.d("LifeLogService", "processing queued chunk...")
+                persistTranscriptChunk(next)
+            } catch (e: Exception) {
+                Log.e("LifeLogService", "queued persistTranscriptChunk error: ${e.message}", e)
+            } finally {
+                transcriptionBusy.set(false)
+                if (pendingTranscriptionChunk != null) drainPendingTranscriptionChunk()
+            }
+        }
+    }
+
+    private fun setWakeStatus(state: String, detail: String = "") {
+        sendBroadcast(Intent(WakeWordService.ACTION_WAKE_STATE).apply {
+            setPackage(packageName)
+            putExtra(WakeWordService.EXTRA_STATE, state)
+            putExtra(WakeWordService.EXTRA_DETAIL, detail)
+        })
+        val text = if (detail.isNotBlank()) "Background telemetry active • $state: $detail" else "Background telemetry active • $state"
+        NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, createNotification(text))
+    }
+
+    private suspend fun persistTranscriptChunk(pcm: ByteArray) {
+        if (!whisperEngine.isReady()) {
+            Log.w("LifeLogService", "Whisper model not ready")
+            return
+        }
+        val text = whisperEngine.transcribePcm16(pcm).trim()
+        if (text.isEmpty()) {
+            Log.d("LifeLogService", "transcription result empty")
+            return
+        }
+        if (!shouldPersistTranscript(text)) {
+            Log.d("LifeLogService", "transcript filtered (hallucination or duplicate): '$text'")
+            return
+        }
+        phoneLogDao.insert(
+            PhoneLogEntity(
+                id = System.currentTimeMillis(),
+                ts = Instant.now().toString(),
+                deviceId = Build.MODEL,
+                kind = "transcript",
+                text = text,
+                transcriptId = 0L,
+                sourceType = "on_device_asr",
+                speakerId = "",
+                speakerConfidence = 0.0,
+                tags = "",
+                importance = 0.8,
+                mediaLikelihood = 0.0,
+                dialogDensity = 0.0,
+                source = "lifelog_service_mic",
+            )
+        )
+        Log.i("LifeLogService", "transcript saved: $text")
+        // Trigger UI refresh via broadcast
+        sendBroadcast(Intent("com.lifelog.phone.REFRESH_CHAT").apply {
+            setPackage(packageName)
+            putExtra("new_message", "true")
+        })
+    }
+
+    private suspend fun cleanupHistoricalTranscriptNoise() {
+
+        val transcriptRows = phoneLogDao.getByKind("transcript", 1500)
+        if (transcriptRows.isEmpty()) return
+        val idsToDelete = transcriptRows
+            .filter { shouldDeleteHistoricalTranscript(it.text) }
+            .map { it.id }
+        if (idsToDelete.isNotEmpty()) {
+            phoneLogDao.deleteByIds(idsToDelete)
+        }
+        Log.i("LifeLogService", "historical transcript cleanup removed=${idsToDelete.size}")
+    }
+
+    private suspend fun shouldPersistTranscript(text: String): Boolean {
+        if (isLikelyHallucination(text)) {
+            Log.d("LifeLogService", "transcript isLikelyHallucination: '$text'")
+            return false
+        }
+        val normalized = normalizeTranscriptText(text)
+        if (normalized.isBlank()) {
+            Log.d("LifeLogService", "transcript normalizeTranscriptText isBlank: '$text'")
+            return false
+        }
+        val recent = phoneLogDao.getByKind("transcript", 5)
+        val isDup = recent.any { normalizeTranscriptText(it.text) == normalized }
+        if (isDup) {
+            Log.d("LifeLogService", "transcript is duplicate of recent: '$text'")
+            return false
+        }
+        return true
+    }
+
+
+    private fun shouldDeleteHistoricalTranscript(text: String): Boolean {
+        return isLikelyHallucination(text)
+    }
+
+    private fun normalizeTranscriptText(text: String): String {
+        return text
+            .lowercase()
+            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun chunkEnergy(pcm: ByteArray): Double {
+        if (pcm.size < 3200) return 0.0
+        var sum = 0L
+        var i = 0
+        while (i + 1 < pcm.size) {
+            val lo = pcm[i].toInt() and 0xFF
+            val hi = pcm[i + 1].toInt()
+            val s = (hi shl 8) or lo
+            sum += if (s < 0) -s.toLong() else s.toLong()
+            i += 2
+        }
+        return (sum.toDouble() / (pcm.size / 2)) / 32768.0
+    }
+
+    private fun isLikelyHallucination(text: String): Boolean {
+        // Normalize: strip leading/trailing brackets and whitespace before tag matching
+        val clean = text.trim().lowercase().replace(Regex("^[\\s\\[]+|[\\s\\]]+$"), "").trim()
+        val fullClean = text.trim().lowercase()
+        // Known non-speech Whisper tags
+        val knownTags = setOf("music", "laughter", "noise", "inaudible", "applause", "silence", "music playing")
+        if (clean in knownTags) return true
+        if (knownTags.any { fullClean.contains("[$it]") }) return true
+        if (Regex("\\[\\s*(music|laughter|noise|inaudible|applause|silence|music playing)\\s*\\]").containsMatchIn(fullClean)) return true
+
+        if (fullClean.length < 4) return true
+        if (!fullClean.any { it.isLetter() }) return true
+        if (Regex("(.)\\1{5,}").containsMatchIn(fullClean)) return true
+
+        val tokens = clean.split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (tokens.size < 2) return true
+        
+        val joined = tokens.joinToString(" ")
+        if (joined == "the the" || joined == "and then the") return true
+        if (joined.startsWith("and then the other one")) return true
+        if (joined.contains("other side of the other side")) return true
+        if (joined.contains("and and then the other one is the other one is")) return true
+
+        return false
+    }
+
+
     private fun startHeartbeatLoop() {
         scope.launch {
+            var backoffDelay = 30_000L
+            var consecutiveFailures = 0
             while (isActive) {
-                try {
-                    sendTelemetryCycle()
-                } catch (e: Exception) {
-                    Log.e("LifeLogService", "Telemetry error: ${e.message}")
+                val baseUrl = resolvedSyncBaseUrl()
+                if (baseUrl.isBlank()) {
+                    Log.d("LifeLogService", "No backend URL configured, skipping telemetry for 5min")
+                    delay(300_000L)
+                    continue
                 }
-                delay(30000)
+                val result = runCatching { sendTelemetryCycle() }
+                if (result.isSuccess) {
+                    backoffDelay = 30_000L
+                    consecutiveFailures = 0
+                } else {
+                    consecutiveFailures++
+                    backoffDelay = (30_000L * (1L shl (consecutiveFailures - 1))).coerceAtMost(600_000L)
+                    Log.d("LifeLogService", "Telemetry failed ($consecutiveFailures×), backing off ${backoffDelay / 1000}s: ${result.exceptionOrNull()?.message}")
+                }
+                delay(backoffDelay)
             }
         }
     }
 
     private fun authHeaders(): Map<String, String> {
-        val token = settingsRepository.cachedToken
+        val token = settingsRepository.cachedLifeLogSyncToken
+            .ifBlank { settingsRepository.lifeLogSyncToken }
         return if (token.isNotEmpty()) mapOf("X-Phone-Token" to token) else emptyMap()
     }
 
+    internal fun resolvedSyncBaseUrl(): String {
+        return settingsRepository.cachedLifeLogSyncUrl
+            .ifBlank { settingsRepository.lifeLogSyncUrl }
+            .trim()
+            .trimEnd('/')
+    }
+
     private suspend fun sendTelemetryCycle() {
-        val baseUrl = settingsRepository.cachedBaseUrl
-        if (baseUrl.isEmpty()) return
+        val baseUrl = resolvedSyncBaseUrl()
 
         // Keep each telemetry/send step isolated so one network failure does not
         // block local reminder logic (especially dwell notifications).
@@ -188,6 +507,9 @@ class LifeLogService : Service() {
     }
 
     private fun postTelemetry(baseUrl: String, kind: String, payload: com.google.gson.JsonObject) {
+        persistLocalPhoneLog(kind, payload)
+        if (baseUrl.isBlank()) return
+
         val envelope = com.google.gson.JsonObject().apply {
             addProperty("device_id", android.os.Build.MODEL)
             addProperty("kind", kind)
@@ -311,6 +633,12 @@ class LifeLogService : Service() {
 
         val events = readDeviceCalendarEvents(now)
         if (events.isEmpty()) return
+        persistLocalCalendarEvents(events)
+
+        if (baseUrl.isBlank()) {
+            Log.i("LifeLogService", "Calendar mirrored locally: ${events.size} events")
+            return
+        }
 
         var synced = 0
         for (event in events) {
@@ -594,7 +922,7 @@ class LifeLogService : Service() {
             appendAssistantChatPrompt("Got it. I'll use $finalPlace for this place.")
         }
 
-        val baseUrl = settingsRepository.cachedBaseUrl.trim().trimEnd('/')
+        val baseUrl = resolvedSyncBaseUrl()
         if (baseUrl.isBlank()) {
             Log.w("LifeLogService", "location confirmation saved locally (no base URL)")
             return
@@ -631,7 +959,7 @@ class LifeLogService : Service() {
         appendUserChatMessage(userText)
         appendAssistantChatPrompt("Saved. Thanks for the update.")
 
-        val baseUrl = settingsRepository.cachedBaseUrl.trim().trimEnd('/')
+        val baseUrl = resolvedSyncBaseUrl()
         if (baseUrl.isNotBlank()) {
             val day = LocalDate.now().toString()
             lifeLogApi.submitMealResponse(
@@ -887,6 +1215,110 @@ class LifeLogService : Service() {
         }
     }
 
+    private fun persistLocalPhoneLog(kind: String, payload: com.google.gson.JsonObject) {
+        val summary = summarizePayload(kind, payload)
+        if (summary.isBlank()) return
+        scope.launch {
+            runCatching {
+                phoneLogDao.insert(
+                    PhoneLogEntity(
+                        id = System.currentTimeMillis(),
+                        ts = Instant.now().toString(),
+                        deviceId = android.os.Build.MODEL,
+                        kind = kind,
+                        text = summary,
+                        transcriptId = 0L,
+                        sourceType = "phone_local",
+                        speakerId = "",
+                        speakerConfidence = 0.0,
+                        tags = "",
+                        importance = 0.4,
+                        mediaLikelihood = 0.0,
+                        dialogDensity = 0.0,
+                        source = "phone"
+                    )
+                )
+            }.onFailure { e ->
+                Log.w("LifeLogService", "local phone log insert failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun summarizePayload(kind: String, payload: com.google.gson.JsonObject): String {
+        fun stringValue(key: String): String = runCatching { payload.get(key).asString }.getOrDefault("").trim()
+        fun doubleValue(key: String): Double? = runCatching { payload.get(key).asDouble }.getOrNull()
+        fun longValue(key: String): Long? = runCatching { payload.get(key).asLong }.getOrNull()
+
+        return when (kind) {
+            "battery" -> {
+                val pct = longValue("percentage")?.toString().orEmpty()
+                val status = stringValue("status")
+                val plugged = stringValue("plugged")
+                listOf("Battery", pct.takeIf { it.isNotBlank() }?.let { "$it%" }, status, plugged)
+                    .filterNotNull()
+                    .filter { it.isNotBlank() }
+                    .joinToString(" ")
+            }
+            "wifi" -> {
+                val network = stringValue("network")
+                val ssid = stringValue("ssid")
+                val ip = stringValue("ip")
+                listOf("Network", network, ssid.takeIf { it.isNotBlank() }?.let { "SSID $it" }, ip.takeIf { it.isNotBlank() }?.let { "IP $it" })
+                    .filterNotNull()
+                    .filter { it.isNotBlank() }
+                    .joinToString(" | ")
+            }
+            "location" -> {
+                val lat = doubleValue("latitude")
+                val lon = doubleValue("longitude")
+                val accuracy = doubleValue("accuracy")
+                buildString {
+                    append("Location")
+                    if (lat != null && lon != null) append(" $lat,$lon")
+                    if (accuracy != null) append(" accuracy ${accuracy.toInt()}m")
+                }
+            }
+            "heartbeat" -> "Heartbeat ok"
+            "reminder" -> payload.toString()
+            "meal_response" -> payload.toString()
+            "location_confirmed", "location_corrected" -> payload.toString()
+            else -> payload.toString()
+        }
+    }
+
+    private fun persistLocalCalendarEvents(events: List<CalendarSyncEvent>) {
+        scope.launch {
+            runCatching {
+                calendarEventDao.clearAll()
+                calendarEventDao.insertAll(
+                    events.mapIndexed { index, event ->
+                        CalendarEventEntity(
+                            id = index.toLong() + 1L,
+                            source = event.source,
+                            remoteId = event.remoteId,
+                            calendarId = event.calendarId,
+                            title = event.title,
+                            startTs = event.startTs,
+                            endTs = event.endTs,
+                            timezone = event.timezone,
+                            recurrenceRule = event.recurrenceRule,
+                            location = event.location,
+                            notes = event.notes,
+                            isAllDay = event.isAllDay,
+                            status = event.status,
+                            updatedAt = Instant.now().toString(),
+                            display = listOf(event.title, event.location, event.notes)
+                                .filter { it.isNotBlank() }
+                                .joinToString(" | ")
+                        )
+                    }
+                )
+            }.onFailure { e ->
+                Log.w("LifeLogService", "local calendar mirror failed: ${e.message}")
+            }
+        }
+    }
+
     private fun readDeviceCalendarEvents(nowMs: Long): List<CalendarSyncEvent> {
         if (!hasCalendarPermission()) return emptyList()
 
@@ -1015,7 +1447,7 @@ class LifeLogService : Service() {
         }
     }
 
-    private fun createNotification(): Notification {
+    private fun createNotification(contentText: String = "Background telemetry active"): Notification {
         val channelId = "lifelog_service"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -1036,7 +1468,7 @@ class LifeLogService : Service() {
 
         return NotificationCompat.Builder(this, channelId)
             .setContentTitle("LifeLog")
-            .setContentText("Background telemetry active")
+            .setContentText(contentText)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -1062,6 +1494,7 @@ class LifeLogService : Service() {
     // ── Speaker identification ──────────────────────────────────────────────
 
     private suspend fun maybePollSpeakerQuestion(baseUrl: String) {
+        if (baseUrl.isBlank()) return
         val req = Request.Builder()
             .url("${baseUrl.trimEnd('/')}/phone/speaker/pending")
             .get()
@@ -1139,7 +1572,7 @@ class LifeLogService : Service() {
             ?.toString()?.trim().orEmpty()
         if (tempId.isEmpty() || name.isEmpty()) return
 
-        val baseUrl = settingsRepository.cachedBaseUrl.trim().trimEnd('/')
+        val baseUrl = resolvedSyncBaseUrl()
         if (baseUrl.isEmpty()) return
 
         val payload = JSONObject().apply {
@@ -1171,8 +1604,19 @@ class LifeLogService : Service() {
 
     companion object {
         private const val NOTIFICATION_ID = 1001
+        const val ACTION_TRANSCRIPTION_START = "com.lifelog.phone.action.TRANSCRIPTION_START"
+        const val ACTION_TRANSCRIPTION_STOP = "com.lifelog.phone.action.TRANSCRIPTION_STOP"
+        private const val KEY_TRANSCRIPT_CLEANUP_AT_MS = "transcript_cleanup_at_ms"
         private const val CALENDAR_SYNC_INTERVAL_MS = 15L * 60L * 1000L
+        private const val TRANSCRIPT_CLEANUP_INTERVAL_MS = 12L * 60L * 60L * 1000L
+        private const val TRANSCRIPTION_SAMPLE_RATE = 16_000
+        private const val TRANSCRIPTION_CHUNK_MS = 4_000L  // shorter chunks reduce UI latency and missed speech
+        private const val TRANSCRIPTION_CHUNK_SAMPLES = (TRANSCRIPTION_SAMPLE_RATE * TRANSCRIPTION_CHUNK_MS / 1000).toInt()
+        private const val TRANSCRIPTION_CHUNK_BYTES = TRANSCRIPTION_CHUNK_SAMPLES * 2
+        private const val TRANSCRIPTION_VAD_THRESHOLD = 0.0012
         private const val MAX_CALENDAR_EVENTS_PER_SYNC = 200
+
+
         private const val REMINDER_CHANNEL_ID = "lifelog_meal_reminders"
         private const val REMINDER_NOTIFICATION_BASE = 2200
         private const val MEAL_REMINDER_WINDOW_MINUTES = 25L

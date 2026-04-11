@@ -16,6 +16,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.READ_CALENDAR" />
 
+    <!-- On-device Gemini Nano via AICore (optional — falls back gracefully if not available) -->
+    <uses-feature
+        android:name="android.software.ai_capabilities"
+        android:required="false" />
+    <!-- AICore library requires API 31 but we guard all calls at runtime -->
+    <uses-sdk tools:overrideLibrary="com.google.ai.edge.aicore" />
+
     <application
         android:name=".LifeLogApplication"
         android:allowBackup="true"
@@ -46,6 +53,15 @@
             android:name=".service.WakeWordService"
             android:exported="false"
             android:foregroundServiceType="dataSync|microphone" />
+
+        <!-- ADB debug receiver for headless chat testing (eval harness) -->
+        <receiver
+            android:name=".service.DebugChatReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.lifelog.phone.action.TEST_CHAT" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>

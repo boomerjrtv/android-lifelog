@@ -16,7 +16,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.lifelog.phone.Insight
+import com.lifelog.phone.data.remote.Insight
 import com.lifelog.phone.data.remote.LifeLogApi
 import com.lifelog.phone.presentation.auth.GoogleSignInService
 import com.lifelog.phone.ui.theme.AccentBlue

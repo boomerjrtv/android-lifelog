@@ -2,7 +2,7 @@ plugins {
     id("com.android.application") version "8.4.2"
     id("org.jetbrains.kotlin.android") version "1.9.24"
     id("com.google.devtools.ksp") version "1.9.24-1.0.20"
-    id("com.google.dagger.hilt.android") version "2.51"
+    id("com.google.dagger.hilt.android") version "2.57.1"
 }
 
 android {
@@ -29,7 +29,8 @@ android {
     kotlinOptions {
         jvmTarget = "17"
         freeCompilerArgs += listOf(
-            "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api"
+            "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
+            "-Xskip-metadata-version-check"
         )
     }
     compileOptions {
@@ -42,6 +43,9 @@ android {
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"
+    }
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
     }
 }
 
@@ -65,23 +69,34 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.8.0")
 
     // Hilt
-    implementation("com.google.dagger:hilt-android:2.51")
-    ksp("com.google.dagger:hilt-compiler:2.51")
+    implementation("com.google.dagger:hilt-android:2.57.1")
+    ksp("com.google.dagger:hilt-compiler:2.57.1")
     implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
 
     // Networking
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.code.gson:gson:2.10.1")
     implementation("ai.picovoice:porcupine-android:4.0.0")
-    
+
     // Google Sign-In
     implementation("com.google.android.gms:play-services-auth:21.0.0")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
+    // On-device AI — Gemini Nano via AICore (Pixel 8+, Samsung S24+)
+    implementation("com.google.ai.edge.aicore:aicore:0.0.1-exp01")
+
+    // On-device AI — LiteRT-LM (runs Gemma 4 inside the app, broad Android support)
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.10.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.18.0")
+
     // Room
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.13")
+    testImplementation("androidx.test:core:1.6.1")
 }

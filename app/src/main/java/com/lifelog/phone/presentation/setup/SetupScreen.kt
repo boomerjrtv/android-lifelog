@@ -65,7 +65,7 @@ fun SetupScreen(
                     value = baseUrl,
                     onValueChange = { viewModel.updateBaseUrl(it) },
                     label = { Text("Server URL") },
-                    placeholder = { Text("https://your-tunnel.trycloudflare.com", color = TextMuted) },
+                    placeholder = { Text("https://api.example.com", color = TextMuted) },
                     modifier = Modifier.fillMaxWidth(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                     singleLine = true,
