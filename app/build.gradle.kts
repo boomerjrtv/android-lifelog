@@ -12,8 +12,8 @@ android {
         applicationId = "com.lifelog.phone"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "2.0.1"
 
         buildConfigField("String", "PICOVOICE_ACCESS_KEY", "\"***REMOVED_PICOVOICE_KEY***==\"")
     }
