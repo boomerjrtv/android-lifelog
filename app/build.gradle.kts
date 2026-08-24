@@ -15,7 +15,11 @@ android {
         versionCode = 3
         versionName = "2.0.1"
 
-        buildConfigField("String", "PICOVOICE_ACCESS_KEY", "\"***REMOVED_PICOVOICE_KEY***==\"")
+        buildConfigField(
+            "String",
+            "PICOVOICE_ACCESS_KEY",
+            "\"${providers.environmentVariable("PICOVOICE_ACCESS_KEY").orNull ?: ""}\""
+        )
     }
     buildTypes {
         release {
